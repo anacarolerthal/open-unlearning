@@ -51,6 +51,11 @@ class FinetuneTrainer(Trainer):
                     "tokenizer": self.processing_class,
                 }
                 eval_metrics.update(evaluator.evaluate(**eval_args))
+            prefix = f"{metric_key_prefix}_"
+            eval_metrics = {
+                key if key.startswith(prefix) else f"{prefix}{key}": value
+                for key, value in eval_metrics.items()
+            }
             self.log(eval_metrics)
             return eval_metrics
 

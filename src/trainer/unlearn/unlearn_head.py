@@ -6,6 +6,7 @@ from torch import nn
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from transformers import TrainerCallback
+from transformers.modeling_outputs import CausalLMOutput
 
 from trainer.unlearn.base import UnlearnTrainer
 
@@ -48,13 +49,16 @@ class LowRankHead(nn.Module):
         nn.init.zeros_(self.B.weight)
 
     def forward(self, h):
+        h = h.to(dtype=self.A.weight.dtype)
         return self.B(self.A(h))
 
 
-class _HeadGradClipCallback(TrainerCallback):
+class _HeadOptimizerCallback(TrainerCallback):
     """HF's built-in clipping only covers self.model.parameters() (frozen);
     this clips the actual trainable heads, since max_grad_norm otherwise
-    silently does nothing for them."""
+    silently does nothing for them. Trainer also clears gradients through
+    model.zero_grad(), so the external heads need to be cleared explicitly
+    after each optimizer step."""
 
     def __init__(self, trainer):
         self.trainer = trainer
@@ -65,6 +69,10 @@ class _HeadGradClipCallback(TrainerCallback):
                 self.trainer.retain_head.parameters()
             )
             nn.utils.clip_grad_norm_(head_params, args.max_grad_norm)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        self.trainer.forget_head.zero_grad(set_to_none=True)
+        self.trainer.retain_head.zero_grad(set_to_none=True)
 
 
 class UnlearnHead(UnlearnTrainer):
@@ -79,27 +87,55 @@ class UnlearnHead(UnlearnTrainer):
     """
 
     def __init__(
-        self, rank=16, lam=1.0, epsilon=0.05, calibrate=False, *args, **kwargs
+        self,
+        rank=16,
+        lam=1.0,
+        epsilon=0.05,
+        calibrate=False,
+        prompt_loss_weight=1.0,
+        diagnostics_max_samples=128,
+        *args,
+        **kwargs,
     ):
+        if not isinstance(rank, int) or rank <= 0:
+            raise ValueError(f"rank must be a positive integer, got {rank!r}")
+        if lam < 0:
+            raise ValueError(f"lam must be non-negative, got {lam}")
+        if not 0 <= epsilon <= 1:
+            raise ValueError(f"epsilon must be in [0, 1], got {epsilon}")
+        if prompt_loss_weight < 0:
+            raise ValueError("prompt_loss_weight must be non-negative")
+        if not isinstance(diagnostics_max_samples, int) or diagnostics_max_samples <= 0:
+            raise ValueError(
+                "diagnostics_max_samples must be a positive integer"
+            )
         super().__init__(*args, **kwargs)
+        # The custom loss is already token-normalized and does not consume
+        # model loss kwargs. This restores Trainer's gradient-accumulation
+        # scaling for models such as Llama whose forward accepts **kwargs.
+        self.model_accepts_loss_kwargs = False
+        self.rank = rank
         self.lam = lam
         self.epsilon = epsilon
         self.calibrate = calibrate
+        self.prompt_loss_weight = prompt_loss_weight
+        self.diagnostics_max_samples = diagnostics_max_samples
         self.tau = None if calibrate else 0.0
 
         for p in self.model.parameters():
             p.requires_grad = False
+        self.model.eval()
 
         # Trainer attributes, not submodules of self.model, so self.model's
         # save_pretrained stays a plain reloadable base-model checkpoint.
         base_param = next(self.model.parameters())
         self.forget_head = LowRankHead(
             self.model.config.hidden_size, self.model.config.vocab_size, rank
-        ).to(device=base_param.device, dtype=base_param.dtype)
+        ).to(device=base_param.device)
         self.retain_head = LowRankHead(
             self.model.config.hidden_size, self.model.config.vocab_size, rank
-        ).to(device=base_param.device, dtype=base_param.dtype)
-        self.add_callback(_HeadGradClipCallback(self))
+        ).to(device=base_param.device)
+        self.add_callback(_HeadOptimizerCallback(self))
 
         # Diagnostics/calibration run on the training data itself (as TOFU
         # eval does), not a held-out slice.
@@ -117,25 +153,47 @@ class UnlearnHead(UnlearnTrainer):
             self.optimizer = optimizer_cls(head_params, **optimizer_kwargs)
         return self.optimizer
 
-    def _head_outputs(self, model, input_ids, attention_mask, head):
+    @staticmethod
+    def _base_logits_and_hidden(model, input_ids, attention_mask):
+        """Run only the frozen backbone and output projection."""
+        model.eval()
+        base_model = getattr(model, model.base_model_prefix)
+        output_embeddings = model.get_output_embeddings()
+        if output_embeddings is None:
+            raise RuntimeError(
+                "UnlearnHead requires a model with output embeddings."
+            )
         with torch.no_grad():
-            base_out = model(
+            base_out = base_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                output_hidden_states=True,
+                use_cache=False,
+                return_dict=True,
             )
-        h = base_out.hidden_states[-1]
-        base_out.logits = base_out.logits + head(h)
-        return base_out
+            h = base_out.last_hidden_state
+            z0 = output_embeddings(h)
+        return z0, h
+
+    def _head_outputs(self, model, input_ids, attention_mask, head):
+        z0, h = self._base_logits_and_hidden(model, input_ids, attention_mask)
+        return CausalLMOutput(logits=z0 + head(h))
 
     @staticmethod
     def _ce_loss(logits, labels):
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
-        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-        return loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+        flat_logits = shift_logits.view(-1, shift_logits.size(-1))
+        flat_labels = shift_labels.view(-1)
+        loss = F.cross_entropy(
+            flat_logits, flat_labels, ignore_index=-100, reduction="sum"
         )
+        valid_count = (flat_labels != -100).sum()
+        return loss / valid_count.clamp(min=1)
+
+    @staticmethod
+    def _prompt_labels(input_ids, labels, attention_mask):
+        prompt_mask = (labels == -100) & attention_mask.bool()
+        return input_ids.masked_fill(~prompt_mask, -100)
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
@@ -147,7 +205,15 @@ class UnlearnHead(UnlearnTrainer):
             forget_inputs["attention_mask"],
             self.forget_head,
         )
-        forget_loss = self._ce_loss(forget_outputs.logits, forget_inputs["labels"])
+        forget_answer_loss = self._ce_loss(
+            forget_outputs.logits, forget_inputs["labels"]
+        )
+        forget_prompt_labels = self._prompt_labels(
+            forget_inputs["input_ids"],
+            forget_inputs["labels"],
+            forget_inputs["attention_mask"],
+        )
+        forget_prompt_loss = self._ce_loss(forget_outputs.logits, forget_prompt_labels)
 
         retain_inputs = inputs["retain"]
         retain_outputs = self._head_outputs(
@@ -156,21 +222,29 @@ class UnlearnHead(UnlearnTrainer):
             retain_inputs["attention_mask"],
             self.retain_head,
         )
-        retain_loss = self._ce_loss(retain_outputs.logits, retain_inputs["labels"])
+        retain_answer_loss = self._ce_loss(
+            retain_outputs.logits, retain_inputs["labels"]
+        )
+        retain_prompt_labels = self._prompt_labels(
+            retain_inputs["input_ids"],
+            retain_inputs["labels"],
+            retain_inputs["attention_mask"],
+        )
+        retain_prompt_loss = self._ce_loss(retain_outputs.logits, retain_prompt_labels)
 
-        loss = forget_loss + retain_loss
+        answer_loss = forget_answer_loss + retain_answer_loss
+        prompt_loss = forget_prompt_loss + retain_prompt_loss
+        loss = (
+            answer_loss + self.prompt_loss_weight * prompt_loss
+        ) / (
+            1.0 + self.prompt_loss_weight
+        )
         return (loss, forget_outputs) if return_outputs else loss
 
     def _frozen_logits(self, input_ids, attention_mask):
         """One frozen backbone forward + both heads; no gradients."""
         with torch.no_grad():
-            base_out = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-            )
-            h = base_out.hidden_states[-1]
-            z0 = base_out.logits
+            z0, h = self._base_logits_and_hidden(self.model, input_ids, attention_mask)
             zF = z0 + self.forget_head(h)
             zR = z0 + self.retain_head(h)
         return z0, zF, zR
@@ -195,7 +269,7 @@ class UnlearnHead(UnlearnTrainer):
         return self._masked_ratio(tokF, tokR, prompt_mask)
 
     def _example_metrics(self, item, head_name):
-        """s(q), NLL under z0/z_head/z_U-gated for one held-out example."""
+        """s(q), NLL under z0/z_head/z_U-gated for one sampled example."""
         device = next(self.model.parameters()).device
         input_ids = item["input_ids"].to(device).unsqueeze(0)
         attention_mask = item["attention_mask"].to(device).unsqueeze(0)
@@ -247,16 +321,26 @@ class UnlearnHead(UnlearnTrainer):
         self.tau = torch.quantile(scores, 1 - self.epsilon).item()
         self.log({"unlearn_head/tau": self.tau})
 
+    def _diagnostic_indices(self, dataset):
+        count = len(dataset)
+        if count <= self.diagnostics_max_samples:
+            return list(range(count))
+        generator = torch.Generator().manual_seed(self.args.seed)
+        permutation = torch.randperm(count, generator=generator)
+        return permutation[: self.diagnostics_max_samples].tolist()
+
     def _log_diagnostics(self):
-        """Router/head/end-to-end diagnostics on held-out data, via self.log."""
+        """Router/head/gated diagnostics on a bounded training-data sample."""
         self.model.eval()
+        forget_indices = self._diagnostic_indices(self.forget_cal)
+        retain_indices = self._diagnostic_indices(self.retain_cal)
         forget_metrics = [
             self._example_metrics(self.forget_cal[i], "forget")
-            for i in range(len(self.forget_cal))
+            for i in forget_indices
         ]
         retain_metrics = [
             self._example_metrics(self.retain_cal[i], "retain")
-            for i in range(len(self.retain_cal))
+            for i in retain_indices
         ]
 
         forget_scores = [m["score"] for m in forget_metrics]
@@ -302,8 +386,13 @@ class UnlearnHead(UnlearnTrainer):
                 "forget_head": self.forget_head.state_dict(),
                 "retain_head": self.retain_head.state_dict(),
                 "tau": self.tau,
+                "rank": self.rank,
                 "lam": self.lam,
                 "epsilon": self.epsilon,
+                "prompt_loss_weight": self.prompt_loss_weight,
+                "backbone": self.model.config._name_or_path,
+                "model_type": self.model.config.model_type,
+                "format_version": 1,
             },
             path,
         )

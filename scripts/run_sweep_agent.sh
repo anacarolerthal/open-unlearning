@@ -1,11 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# Register a sweep once yourself (prints an entity/project/sweep_id):
-#   wandb sweep sweeps/npo_tofu_1b.yaml
-#   wandb sweep sweeps/unlearn_head_tofu_1b.yaml
-#
-# Usage: bash scripts/run_sweep_agent.sh <entity/project/sweep_id>
+default_sweep_id="juanbelieni-lab/unlearn-head/ddcmvbsd"
+sweep_id="${1:-${WANDB_SWEEP_ID:-$default_sweep_id}}"
 
-sweep_id="${1:?usage: $0 <entity/project/sweep_id>}"
-wandb agent "$sweep_id"
+# Run the agent in the same uv environment used by every sweep trial.
+uv run wandb agent "$sweep_id"

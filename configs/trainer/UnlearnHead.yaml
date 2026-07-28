@@ -7,3 +7,5 @@ method_args:
   lam: 1.0
   epsilon: 0.05
   calibrate: false
+  prompt_loss_weight: 1.0
+  diagnostics_max_samples: 128
