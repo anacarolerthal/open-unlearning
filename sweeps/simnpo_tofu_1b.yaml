@@ -1,4 +1,4 @@
-# Register: wandb sweep sweeps/unlearn_head_tofu_1b.yaml 
+# Register: wandb sweep sweeps/simnpo_tofu_1b.yaml
 # Launch:   wandb agent <entity/project/sweep_id>
 
 program: src/train.py
@@ -11,10 +11,6 @@ metric:
 parameters:
   trainer.args.learning_rate:
     values: [1.0e-5, 1.0e-4]
-  trainer.method_args.rank:
-    values: [8, 16, 32]
-  trainer.method_args.lam:
-    values: [0.5, 1.0]
   trainer.args.num_train_epochs:
     values: [5, 10]
   trainer.args.per_device_train_batch_size:
@@ -25,7 +21,7 @@ command:
   - src/train.py
   - --config-name=unlearn.yaml
   - experiment=unlearn/tofu/default.yaml
-  - trainer=UnlearnHead
+  - trainer=SimNPO
   - model=Llama-3.2-1B-Instruct
   - model.model_args.pretrained_model_name_or_path=open-unlearning/tofu_Llama-3.2-1B-Instruct_full
   - forget_split=forget10
@@ -35,5 +31,5 @@ command:
   - trainer.args.report_to=wandb
   - trainer.args.eval_strategy=no
   - trainer.args.eval_on_start=False
-  - task_name=sweep_unlearn_head_${oc.env:WANDB_RUN_ID}
+  - task_name=sweep_simnpo_${oc.env:WANDB_RUN_ID}
   - ${args_no_hyphens}

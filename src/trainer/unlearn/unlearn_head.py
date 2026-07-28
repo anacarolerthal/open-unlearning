@@ -3,7 +3,6 @@ import statistics
 
 import torch
 from torch import nn
-from torch.utils.data import Subset
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from transformers import TrainerCallback
@@ -70,15 +69,23 @@ class _HeadGradClipCallback(TrainerCallback):
 
 class UnlearnHead(UnlearnTrainer):
     """Single-request UnlearnHead: two low-rank heads on a frozen backbone,
-    gated at inference by a calibrated forget/retain likelihood-ratio router."""
+    gated at inference by a forget/retain likelihood-ratio router.
+
+    By default (calibrate=False) the router uses a fixed tau=0: the gate
+    opens whenever the forget head finds a prompt more likely than the
+    retain head does, no calibration pass needed. Set calibrate=True to
+    instead pick tau from a target false-positive rate (epsilon) on the
+    retain set, via _calibrate() (unused by default, kept for later use).
+    """
 
     def __init__(
-        self, rank=16, lam=1.0, epsilon=0.05, cal_split=0.10, *args, **kwargs
+        self, rank=16, lam=1.0, epsilon=0.05, calibrate=False, *args, **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.lam = lam
         self.epsilon = epsilon
-        self.tau = None
+        self.calibrate = calibrate
+        self.tau = None if calibrate else 0.0
 
         for p in self.model.parameters():
             p.requires_grad = False
@@ -94,13 +101,10 @@ class UnlearnHead(UnlearnTrainer):
         ).to(device=base_param.device, dtype=base_param.dtype)
         self.add_callback(_HeadGradClipCallback(self))
 
-        self.retain_cal = None
-        self.forget_cal = None
-        if self.train_dataset is not None:
-            if getattr(self.train_dataset, "retain", None) is not None:
-                self.retain_cal = self._split_holdout("retain", cal_split)
-            if getattr(self.train_dataset, "forget", None) is not None:
-                self.forget_cal = self._split_holdout("forget", cal_split)
+        # Diagnostics/calibration run on the training data itself (as TOFU
+        # eval does), not a held-out slice.
+        self.retain_cal = getattr(self.train_dataset, "retain", None)
+        self.forget_cal = getattr(self.train_dataset, "forget", None)
 
     def create_optimizer(self):
         if self.optimizer is None:
@@ -112,16 +116,6 @@ class UnlearnHead(UnlearnTrainer):
             )
             self.optimizer = optimizer_cls(head_params, **optimizer_kwargs)
         return self.optimizer
-
-    def _split_holdout(self, attr_name, frac):
-        dataset = getattr(self.train_dataset, attr_name)
-        n = len(dataset)
-        generator = torch.Generator().manual_seed(0)
-        perm = torch.randperm(n, generator=generator).tolist()
-        n_holdout = max(1, int(frac * n))
-        holdout_indices, train_indices = perm[:n_holdout], perm[n_holdout:]
-        setattr(self.train_dataset, attr_name, Subset(dataset, train_indices))
-        return Subset(dataset, holdout_indices)
 
     def _head_outputs(self, model, input_ids, attention_mask, head):
         with torch.no_grad():
@@ -317,7 +311,7 @@ class UnlearnHead(UnlearnTrainer):
     def train(self, *args, **kwargs):
         output = super().train(*args, **kwargs)
         if self.accelerator.is_local_main_process:
-            if self.retain_cal is not None:
+            if self.calibrate and self.retain_cal is not None:
                 self._calibrate()
             if self.retain_cal is not None and self.forget_cal is not None:
                 self._log_diagnostics()
