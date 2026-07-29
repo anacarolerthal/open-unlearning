@@ -4,7 +4,6 @@ import statistics
 import torch
 from torch import nn
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
 from transformers import TrainerCallback
 from transformers.modeling_outputs import CausalLMOutput
 
@@ -16,27 +15,9 @@ def _safe_mean(values):
     return statistics.fmean(values) if values else float("nan")
 
 
-def _safe_std(values):
-    values = [v for v in values if v == v]
-    return statistics.pstdev(values) if len(values) > 1 else 0.0
-
-
 def _fraction_above(values, threshold):
     values = [v for v in values if v == v]
     return sum(1 for v in values if v > threshold) / len(values) if values else float("nan")
-
-
-def _auc(forget_scores, retain_scores):
-    forget_scores = [v for v in forget_scores if v == v]
-    retain_scores = [v for v in retain_scores if v == v]
-    if not forget_scores or not retain_scores:
-        return float("nan")
-    y_true = [1] * len(forget_scores) + [0] * len(retain_scores)
-    y_score = forget_scores + retain_scores
-    try:
-        return roc_auc_score(y_true, y_score)
-    except ValueError:
-        return float("nan")
 
 
 class LowRankHead(nn.Module):
@@ -121,6 +102,8 @@ class UnlearnHead(UnlearnTrainer):
         self.prompt_loss_weight = prompt_loss_weight
         self.diagnostics_max_samples = diagnostics_max_samples
         self.tau = None if calibrate else 0.0
+        self._answer_loss_sum = 0.0
+        self._answer_loss_count = 0
 
         for p in self.model.parameters():
             p.requires_grad = False
@@ -141,6 +124,15 @@ class UnlearnHead(UnlearnTrainer):
         # eval does), not a held-out slice.
         self.retain_cal = getattr(self.train_dataset, "retain", None)
         self.forget_cal = getattr(self.train_dataset, "forget", None)
+
+    def log(self, logs, start_time=None):
+        if self._answer_loss_count:
+            logs["unlearn_head/answer_loss"] = (
+                self._answer_loss_sum / self._answer_loss_count
+            )
+            self._answer_loss_sum = 0.0
+            self._answer_loss_count = 0
+        super().log(logs, start_time)
 
     def create_optimizer(self):
         if self.optimizer is None:
@@ -239,6 +231,10 @@ class UnlearnHead(UnlearnTrainer):
         ) / (
             1.0 + self.prompt_loss_weight
         )
+
+        self._answer_loss_sum += answer_loss.detach().item()
+        self._answer_loss_count += 1
+
         return (loss, forget_outputs) if return_outputs else loss
 
     def _frozen_logits(self, input_ids, attention_mask):
@@ -354,19 +350,12 @@ class UnlearnHead(UnlearnTrainer):
         metrics = {
             # Sanity checks
             "unlearn_head/router_score_mean_forget": _safe_mean(forget_scores),
-            "unlearn_head/router_score_std_forget": _safe_std(forget_scores),
             "unlearn_head/router_score_mean_retain": _safe_mean(retain_scores),
-            "unlearn_head/router_score_std_retain": _safe_std(retain_scores),
             # Router metrics: is the classifier good, independent of the heads?
-            "unlearn_head/router_auc": _auc(forget_scores, retain_scores),
             "unlearn_head/router_tpr_at_tau": _fraction_above(forget_scores, self.tau),
             "unlearn_head/router_fpr_at_tau": _fraction_above(retain_scores, self.tau),
             # Head metrics: do the heads edit logits enough, gate forced open?
-            "unlearn_head/head_forget_nll_z0": forget_nll_z0,
-            "unlearn_head/head_forget_nll_zF": forget_nll_zF,
             "unlearn_head/head_forget_nll_gap": forget_nll_zF - forget_nll_z0,
-            "unlearn_head/head_retain_nll_z0": retain_nll_z0,
-            "unlearn_head/head_retain_nll_zR": retain_nll_zR,
             "unlearn_head/head_retain_nll_gap": retain_nll_zR - retain_nll_z0,
             # End-to-end metrics: router and heads together, as a user sees it
             "unlearn_head/e2e_forget_nll_gated": _safe_mean(
