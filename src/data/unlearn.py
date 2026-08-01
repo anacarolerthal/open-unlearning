@@ -4,16 +4,20 @@ from torch.utils.data import Dataset
 
 class ForgetRetainDataset(Dataset):
     # https://github.com/OPTML-Group/SOUL/blob/main/src/dataset/Base.py
-    def __init__(self, forget, retain, anchor="forget"):
+    def __init__(self, forget, retain, calibration=None, anchor="forget"):
         """Wraps the forget retain dataset into unlearning dataset.
 
         Args:
             forget (Dataset): Forget Dataset
             retain (Dataset): Retain Dataset
+            calibration (Dataset, optional): Held-out prompts used by methods
+                that calibrate inference-time behavior. These examples are not
+                sampled into training batches.
             anchor (str, optional): Specifies which dataset to anchor while randomly sampling from the other dataset. Defaults to 'forget'.
         """
         self.forget = forget
         self.retain = retain
+        self.calibration = calibration
         self.anchor = anchor
 
     def __len__(self):

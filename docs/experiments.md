@@ -215,6 +215,12 @@ python src/train.py --config-name=train.yaml experiment=finetune/tofu/default \
 
 Distributed training configurations enable scaling experiments across multiple devices or nodes. In most cases, default distributed settings from [`configs/accelerate/default_config.yaml`](../configs/accelerate/default_config.yaml) are sufficient. You can run distributed training with the below command that uses DeepSpeed for distributed training (which is our default setup):
 
+DeepSpeed is an optional dependency because single-GPU and standard DDP runs
+do not require its CUDA extensions. Before using the DeepSpeed configuration,
+install a system CUDA toolkit compatible with the PyTorch CUDA build, then run
+`pip install -e ".[deepspeed]"` and verify it with
+`python -m deepspeed.env_report`.
+
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
   --config_file configs/accelerate/default_config.yaml --main_process_port 18765 \

@@ -1,9 +1,10 @@
+import math
 import os
 import statistics
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 from transformers import TrainerCallback
 from transformers.modeling_outputs import CausalLMOutput
 
@@ -11,13 +12,37 @@ from trainer.unlearn.base import UnlearnTrainer
 
 
 def _safe_mean(values):
-    values = [v for v in values if v == v]  # drop NaNs
+    values = [v for v in values if not math.isnan(v)]
     return statistics.fmean(values) if values else float("nan")
 
 
 def _fraction_above(values, threshold):
-    values = [v for v in values if v == v]
-    return sum(1 for v in values if v > threshold) / len(values) if values else float("nan")
+    values = [v for v in values if not math.isnan(v)]
+    return (
+        sum(1 for v in values if v > threshold) / len(values)
+        if values
+        else float("nan")
+    )
+
+
+def _pairwise_auc(positive_scores, negative_scores):
+    """Empirical AUROC without adding a metrics-library dependency."""
+    positive_scores = [v for v in positive_scores if not math.isnan(v)]
+    negative_scores = [v for v in negative_scores if not math.isnan(v)]
+    if not positive_scores or not negative_scores:
+        return float("nan")
+
+    wins = sum(
+        positive > negative
+        for positive in positive_scores
+        for negative in negative_scores
+    )
+    ties = sum(
+        positive == negative
+        for positive in positive_scores
+        for negative in negative_scores
+    )
+    return (wins + 0.5 * ties) / (len(positive_scores) * len(negative_scores))
 
 
 class LowRankHead(nn.Module):
@@ -57,14 +82,15 @@ class _HeadOptimizerCallback(TrainerCallback):
 
 
 class UnlearnHead(UnlearnTrainer):
-    """Single-request UnlearnHead: two low-rank heads on a frozen backbone,
-    gated at inference by a forget/retain likelihood-ratio router.
+    """Single-request UnlearnHead: two low-rank heads on a frozen backbone.
 
-    By default (calibrate=False) the router uses a fixed tau=0: the gate
-    opens whenever the forget head finds a prompt more likely than the
-    retain head does, no calibration pass needed. Set calibrate=True to
-    instead pick tau from a target false-positive rate (epsilon) on the
-    retain set, via _calibrate() (unused by default, kept for later use).
+    ``router_mode="calibrated"`` chooses the likelihood-ratio threshold from
+    held-out prompts at the target false-positive rate. ``likelihood_ratio``
+    retains the old tau=0 behavior as a diagnostic, while ``always_on`` is a
+    head-only ablation that applies the correction to every prompt.
+
+    ``calibrate=True`` remains a backwards-compatible alias for requesting
+    calibration with ``router_mode="likelihood_ratio"``.
     """
 
     def __init__(
@@ -73,8 +99,10 @@ class UnlearnHead(UnlearnTrainer):
         lam=1.0,
         epsilon=0.05,
         calibrate=False,
+        router_mode="calibrated",
         prompt_loss_weight=1.0,
         diagnostics_max_samples=128,
+        save_base_model=False,
         *args,
         **kwargs,
     ):
@@ -84,12 +112,19 @@ class UnlearnHead(UnlearnTrainer):
             raise ValueError(f"lam must be non-negative, got {lam}")
         if not 0 <= epsilon <= 1:
             raise ValueError(f"epsilon must be in [0, 1], got {epsilon}")
+        if router_mode not in {"likelihood_ratio", "calibrated", "always_on"}:
+            raise ValueError(
+                "router_mode must be 'likelihood_ratio', 'calibrated', or "
+                f"'always_on', got {router_mode!r}"
+            )
+        if router_mode == "always_on" and calibrate:
+            raise ValueError(
+                "calibrate=True is incompatible with router_mode='always_on'"
+            )
         if prompt_loss_weight < 0:
             raise ValueError("prompt_loss_weight must be non-negative")
         if not isinstance(diagnostics_max_samples, int) or diagnostics_max_samples <= 0:
-            raise ValueError(
-                "diagnostics_max_samples must be a positive integer"
-            )
+            raise ValueError("diagnostics_max_samples must be a positive integer")
         super().__init__(*args, **kwargs)
         # The custom loss is already token-normalized and does not consume
         # model loss kwargs. This restores Trainer's gradient-accumulation
@@ -99,9 +134,12 @@ class UnlearnHead(UnlearnTrainer):
         self.lam = lam
         self.epsilon = epsilon
         self.calibrate = calibrate
+        self.router_mode = router_mode
         self.prompt_loss_weight = prompt_loss_weight
         self.diagnostics_max_samples = diagnostics_max_samples
-        self.tau = None if calibrate else 0.0
+        self.save_base_model = save_base_model
+        self.requires_calibration = router_mode == "calibrated" or calibrate
+        self.tau = None if self.requires_calibration else 0.0
         self._answer_loss_sum = 0.0
         self._answer_loss_count = 0
 
@@ -120,10 +158,17 @@ class UnlearnHead(UnlearnTrainer):
         ).to(device=base_param.device)
         self.add_callback(_HeadOptimizerCallback(self))
 
-        # Diagnostics/calibration run on the training data itself (as TOFU
-        # eval does), not a held-out slice.
+        # Head/router diagnostics use the training splits. Threshold
+        # calibration instead uses prompts excluded from head optimization.
         self.retain_cal = getattr(self.train_dataset, "retain", None)
         self.forget_cal = getattr(self.train_dataset, "forget", None)
+        self.router_cal = getattr(self.train_dataset, "calibration", None)
+        if self.requires_calibration and self.router_cal is None:
+            raise ValueError(
+                "Calibrated UnlearnHead routing requires a data.calibration "
+                "dataset. Use router_mode='likelihood_ratio' only for the "
+                "legacy tau=0 diagnostic."
+            )
 
     def log(self, logs, start_time=None):
         if self._answer_loss_count:
@@ -152,9 +197,7 @@ class UnlearnHead(UnlearnTrainer):
         base_model = getattr(model, model.base_model_prefix)
         output_embeddings = model.get_output_embeddings()
         if output_embeddings is None:
-            raise RuntimeError(
-                "UnlearnHead requires a model with output embeddings."
-            )
+            raise RuntimeError("UnlearnHead requires a model with output embeddings.")
         with torch.no_grad():
             base_out = base_model(
                 input_ids=input_ids,
@@ -226,9 +269,7 @@ class UnlearnHead(UnlearnTrainer):
 
         answer_loss = forget_answer_loss + retain_answer_loss
         prompt_loss = forget_prompt_loss + retain_prompt_loss
-        loss = (
-            answer_loss + self.prompt_loss_weight * prompt_loss
-        ) / (
+        loss = (answer_loss + self.prompt_loss_weight * prompt_loss) / (
             1.0 + self.prompt_loss_weight
         )
 
@@ -260,9 +301,24 @@ class UnlearnHead(UnlearnTrainer):
         """s(q) per example: avg log p_F - log p_R over prompt tokens. Shape [batch]."""
         _, zF, zR = self._frozen_logits(input_ids, attention_mask)
         next_tokens = input_ids[..., 1:]
-        tokF, tokR = self._token_logp(zF, next_tokens), self._token_logp(zR, next_tokens)
+        tokF, tokR = (
+            self._token_logp(zF, next_tokens),
+            self._token_logp(zR, next_tokens),
+        )
         prompt_mask = (labels[..., 1:] == -100) & (attention_mask[..., 1:] == 1)
         return self._masked_ratio(tokF, tokR, prompt_mask)
+
+    def _routing_alpha(self, scores):
+        """Return the per-example correction strength for the configured router."""
+        if self.router_mode == "always_on":
+            return torch.full_like(scores, self.lam)
+        if self.tau is None:
+            raise RuntimeError("Router is not calibrated yet; call train() first.")
+        return torch.where(
+            scores > self.tau,
+            torch.full_like(scores, self.lam),
+            torch.zeros_like(scores),
+        )
 
     def _example_metrics(self, item, head_name):
         """s(q), NLL under z0/z_head/z_U-gated for one sampled example."""
@@ -285,13 +341,14 @@ class UnlearnHead(UnlearnTrainer):
             vals = t[mask]
             return vals.mean().item() if vals.numel() > 0 else float("nan")
 
-        score = self._masked_ratio(tokF, tokR, prompt_mask).item()
+        scores = self._masked_ratio(tokF, tokR, prompt_mask)
+        score = scores.item()
 
         tok_head = tokF if head_name == "forget" else tokR
         nll_z0 = -masked_mean(tok0, answer_mask)
         nll_head = -masked_mean(tok_head, answer_mask)
 
-        alpha = self.lam if score > self.tau else 0.0
+        alpha = self._routing_alpha(scores).item()
         zU = z0 - alpha * (zF - zR)
         nll_gated = -masked_mean(self._token_logp(zU, next_tokens), answer_mask)
 
@@ -307,15 +364,25 @@ class UnlearnHead(UnlearnTrainer):
         device = next(self.model.parameters()).device
         scores = []
         with torch.no_grad():
-            for i in range(len(self.retain_cal)):
-                item = self.retain_cal[i]
+            for i in range(len(self.router_cal)):
+                item = self.router_cal[i]
                 input_ids = item["input_ids"].to(device).unsqueeze(0)
                 attention_mask = item["attention_mask"].to(device).unsqueeze(0)
                 labels = item["labels"].to(device).unsqueeze(0)
-                scores.append(self._prompt_score(input_ids, attention_mask, labels).item())
+                scores.append(
+                    self._prompt_score(input_ids, attention_mask, labels).item()
+                )
+        if not scores:
+            raise ValueError("UnlearnHead's router calibration dataset is empty.")
         scores = torch.tensor(scores)
         self.tau = torch.quantile(scores, 1 - self.epsilon).item()
-        self.log({"unlearn_head/tau": self.tau})
+        if self.accelerator.is_local_main_process:
+            self.log(
+                {
+                    "unlearn_head/tau": self.tau,
+                    "unlearn_head/calibration_size": len(scores),
+                }
+            )
 
     def _diagnostic_indices(self, dataset):
         count = len(dataset)
@@ -331,12 +398,10 @@ class UnlearnHead(UnlearnTrainer):
         forget_indices = self._diagnostic_indices(self.forget_cal)
         retain_indices = self._diagnostic_indices(self.retain_cal)
         forget_metrics = [
-            self._example_metrics(self.forget_cal[i], "forget")
-            for i in forget_indices
+            self._example_metrics(self.forget_cal[i], "forget") for i in forget_indices
         ]
         retain_metrics = [
-            self._example_metrics(self.retain_cal[i], "retain")
-            for i in retain_indices
+            self._example_metrics(self.retain_cal[i], "retain") for i in retain_indices
         ]
 
         forget_scores = [m["score"] for m in forget_metrics]
@@ -352,8 +417,22 @@ class UnlearnHead(UnlearnTrainer):
             "unlearn_head/router_score_mean_forget": _safe_mean(forget_scores),
             "unlearn_head/router_score_mean_retain": _safe_mean(retain_scores),
             # Router metrics: is the classifier good, independent of the heads?
+            "unlearn_head/router_auc": _pairwise_auc(forget_scores, retain_scores),
             "unlearn_head/router_tpr_at_tau": _fraction_above(forget_scores, self.tau),
             "unlearn_head/router_fpr_at_tau": _fraction_above(retain_scores, self.tau),
+            # Effective activation rates include the always-on ablation.
+            "unlearn_head/router_activation_rate_forget": _safe_mean(
+                [
+                    self._routing_alpha(torch.tensor([score])).item() > 0
+                    for score in forget_scores
+                ]
+            ),
+            "unlearn_head/router_activation_rate_retain": _safe_mean(
+                [
+                    self._routing_alpha(torch.tensor([score])).item() > 0
+                    for score in retain_scores
+                ]
+            ),
             # Head metrics: do the heads edit logits enough, gate forced open?
             "unlearn_head/head_forget_nll_gap": forget_nll_zF - forget_nll_z0,
             "unlearn_head/head_retain_nll_gap": retain_nll_zR - retain_nll_z0,
@@ -368,8 +447,10 @@ class UnlearnHead(UnlearnTrainer):
         self.log(metrics)
         return metrics
 
-    def _save_heads(self):
-        path = os.path.join(self.args.output_dir, "unlearn_head.pt")
+    def _save_heads(self, output_dir=None):
+        output_dir = output_dir or self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, "unlearn_head.pt")
         torch.save(
             {
                 "forget_head": self.forget_head.state_dict(),
@@ -378,6 +459,8 @@ class UnlearnHead(UnlearnTrainer):
                 "rank": self.rank,
                 "lam": self.lam,
                 "epsilon": self.epsilon,
+                "router_mode": self.router_mode,
+                "calibration_size": len(self.router_cal) if self.router_cal else 0,
                 "prompt_loss_weight": self.prompt_loss_weight,
                 "backbone": self.model.config._name_or_path,
                 "model_type": self.model.config.model_type,
@@ -388,13 +471,28 @@ class UnlearnHead(UnlearnTrainer):
 
     def train(self, *args, **kwargs):
         output = super().train(*args, **kwargs)
+        # Run on every process so each evaluator installs the same threshold.
+        # Scores and their quantile are deterministic, so no cross-rank gather
+        # is needed even though only the local main process logs and saves.
+        if self.requires_calibration:
+            self._calibrate()
         if self.accelerator.is_local_main_process:
-            if self.calibrate and self.retain_cal is not None:
-                self._calibrate()
             if self.retain_cal is not None and self.forget_cal is not None:
                 self._log_diagnostics()
             self._save_heads()
         return output
+
+    def save_model(self, output_dir=None, _internal_call=False):
+        """Save lightweight request state without duplicating the frozen base.
+
+        The backbone is immutable and identified in ``unlearn_head.pt``. Set
+        ``save_base_model=True`` only when a self-contained base checkpoint is
+        explicitly required.
+        """
+        if self.save_base_model:
+            return super().save_model(output_dir, _internal_call)
+        if self.accelerator.is_local_main_process:
+            self._save_heads(output_dir)
 
     def _install_correction_hook(self):
         """Shared hook for generate_with_correction/evaluate. Computes alpha(q)
@@ -434,11 +532,7 @@ class UnlearnHead(UnlearnTrainer):
                 prompt_mask = (labels[..., 1:] == -100) & (attention_mask[..., 1:] == 1)
                 scores = self._masked_ratio(tok_f, tok_r, prompt_mask)
                 cache["scores"] = scores
-                cache["alpha"] = torch.where(
-                    scores > self.tau,
-                    torch.full_like(scores, self.lam),
-                    torch.zeros_like(scores),
-                )
+                cache["alpha"] = self._routing_alpha(scores)
             elif cache["alpha"].shape[0] != output.logits.shape[0]:
                 raise RuntimeError(
                     "Batch size changed between decoding steps (likely beam "
@@ -447,7 +541,9 @@ class UnlearnHead(UnlearnTrainer):
                 )
 
             alpha = cache["alpha"].view(-1, *([1] * (delta_f.dim() - 1)))
-            output.logits = output.logits - alpha.to(delta_f.device) * (delta_f - delta_r)
+            output.logits = output.logits - alpha.to(delta_f.device) * (
+                delta_f - delta_r
+            )
             return output
 
         handle = self.model.register_forward_hook(hook, with_kwargs=True)
@@ -490,7 +586,13 @@ class UnlearnHead(UnlearnTrainer):
 
         texts = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
         results = [
-            {"text": t, "score": s.item(), "alpha": a.item(), "tau": self.tau}
+            {
+                "text": t,
+                "score": s.item(),
+                "alpha": a.item(),
+                "tau": self.tau,
+                "router_mode": self.router_mode,
+            }
             for t, s, a in zip(texts, cache["scores"], cache["alpha"])
         ]
         return results[0] if single else results

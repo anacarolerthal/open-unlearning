@@ -6,6 +6,7 @@ defaults:
   - override /data: unlearn
   - override /data/datasets@data.forget: TOFU_QA_forget
   - override /data/datasets@data.retain: TOFU_QA_retain
+  - override /data/datasets@data.calibration: TOFU_QA_holdout
   - override /eval: tofu
 
 model:
@@ -38,6 +39,15 @@ data:
       args:
         hf_args:
           name: ${retain_split}
+  # TODO(unlearn-head): split router calibration from the MIA holdout before
+  # making final privacy claims. For diagnostic sweeps, we intentionally reuse
+  # all of holdout10 for both purposes so tau is estimated without another
+  # arbitrary split or swept calibration variable.
+  calibration:
+    TOFU_QA_holdout:
+      args:
+        hf_args:
+          name: ${holdout_split}
 
 trainer:
   args:

@@ -1,16 +1,22 @@
 """Borrowed implementation from https://github.com/centerforaisafety/wmdp/blob/main/rmu/unlearn.py"""
 
 import re
+
 import torch
-import deepspeed
+
 from trainer.unlearn.grad_diff import GradDiff
+
+try:
+    import deepspeed
+except ImportError:
+    deepspeed = None
 
 
 class RMU(GradDiff):
     def __init__(
         self,
-        module_regex="model\.layers\.7",
-        trainable_params_regex=["model\.layers\.(5|6|7)\.mlp\.down_proj\.weight"],
+        module_regex=r"model\.layers\.7",
+        trainable_params_regex=None,
         steering_coeff=20,
         *args,
         **kwargs,
@@ -22,6 +28,14 @@ class RMU(GradDiff):
             module_path (str): Regex pattern to match module names.
             trainable_param_paths (list of str): List of regex patterns for trainable parameters.
         """
+        if deepspeed is None:
+            raise ImportError(
+                "RMU requires the optional DeepSpeed dependency. Install it "
+                "with `pip install -e '.[deepspeed]'` after installing a "
+                "CUDA toolkit compatible with the PyTorch CUDA build."
+            )
+        if trainable_params_regex is None:
+            trainable_params_regex = [r"model\.layers\.(5|6|7)\.mlp\.down_proj\.weight"]
         super().__init__(*args, **kwargs)
 
         # Create reference model if not already set
@@ -50,7 +64,7 @@ class RMU(GradDiff):
     def _get_matching_module(self, model, module_regex):
         """Returns a single module matching the given regex from a DeepSpeed/DDP-wrapped model."""
         # Handle DeepSpeed and DDP-wrapped models by accessing the underlying module
-        if isinstance(model, deepspeed.DeepSpeedEngine):
+        if deepspeed is not None and isinstance(model, deepspeed.DeepSpeedEngine):
             model = model.module  # Extract the actual PyTorch model inside
 
         matched_modules = {
@@ -89,7 +103,6 @@ class RMU(GradDiff):
                 cache.append(output[0])
             else:
                 cache.append(output)
-            return None
 
         hook_handle = module.register_forward_hook(hook)
         with torch.set_grad_enabled(not (no_grad)):

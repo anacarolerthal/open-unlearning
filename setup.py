@@ -24,6 +24,9 @@ setup(
             "pre-commit==4.0.1",
             "ruff==0.6.9",
         ],  # Install using `pip install ".[dev]"`
+        "deepspeed": [
+            "deepspeed==0.19.2",
+        ],  # Requires a matching system CUDA toolkit and nvcc.
     },
     python_requires=">=3.11",
 )

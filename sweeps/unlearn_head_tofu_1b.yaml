@@ -9,16 +9,17 @@ metric:
   goal: maximize
 
 parameters:
-  trainer.args.learning_rate:
-    values: [1.0e-5, 1.0e-4]
   trainer.method_args.rank:
-    values: [8, 16, 32]
+    # Rank 32 was consistently stronger than 8/16; 64 tests extra capacity.
+    values: [32, 64]
   trainer.method_args.lam:
-    values: [0.5, 1.0]
-  trainer.args.num_train_epochs:
-    values: [5, 10]
-  trainer.args.per_device_train_batch_size:
-    values: [4, 8]
+    # Lambda is an inference-strength ablation. Values above the paper's
+    # nominal [0, 1] budget test whether the learned contrast is under-scaled.
+    values: [1.0, 8.0, 32.0]
+  trainer.method_args.router_mode:
+    # calibrated fixes tau at the holdout (1-epsilon) quantile; always_on
+    # deactivates the router to isolate head/correction quality.
+    values: [calibrated, always_on]
 
 command:
   - uv
@@ -37,8 +38,21 @@ command:
   - retain_split=retain90
   - holdout_split=holdout10
   - retain_logs_path=saves/eval/tofu_Llama-3.2-1B-Instruct_retain90/TOFU_EVAL.json
+  # Fix the training budget. The previous epoch/batch grid confounded the
+  # number of optimizer updates and decayed a new factorized head to zero LR.
+  - trainer.args.learning_rate=1.0e-4
+  - trainer.args.max_steps=250
+  - trainer.args.per_device_train_batch_size=4
+  - trainer.args.gradient_accumulation_steps=4
+  - trainer.args.lr_scheduler_type=constant_with_warmup
+  - trainer.args.warmup_epochs=0.0
+  - trainer.args.warmup_ratio=0.03
+  - trainer.args.weight_decay=0.0
+  # Keep enough prompt supervision for routing without letting it dominate
+  # the already-low answer loss.
+  - trainer.method_args.prompt_loss_weight=0.1
   - trainer.args.report_to=wandb
   - trainer.args.eval_strategy=no
   - trainer.args.eval_on_start=False
-  - task_name=sweep_unlearn_head_lr${trainer.args.learning_rate}_rank${trainer.method_args.rank}_lam${trainer.method_args.lam}_ep${trainer.args.num_train_epochs}_bs${trainer.args.per_device_train_batch_size}_${oc.env:WANDB_RUN_ID}
+  - task_name=sweep_unlearn_head_rank${trainer.method_args.rank}_lam${trainer.method_args.lam}_router${trainer.method_args.router_mode}_${oc.env:WANDB_RUN_ID}
   - ${args_no_hyphens}

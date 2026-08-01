@@ -2,10 +2,18 @@ defaults:
   - finetune
 
 handler: UnlearnHead
+args:
+  # Newly initialized factorized heads benefit from a stable learning rate.
+  lr_scheduler_type: constant_with_warmup
+  warmup_ratio: 0.03
+  max_steps: -1
+  optim: adamw_torch
 method_args:
   rank: 16
   lam: 1.0
   epsilon: 0.05
-  calibrate: false
+  calibrate: false # backwards-compatible alias; prefer router_mode=calibrated
+  router_mode: calibrated
   prompt_loss_weight: 1.0
   diagnostics_max_samples: 128
+  save_base_model: false

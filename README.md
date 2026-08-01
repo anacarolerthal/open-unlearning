@@ -115,7 +115,8 @@ We provide several variants for each of the components in the unlearning pipelin
 conda create -n unlearning python=3.11
 conda activate unlearning
 pip install ".[lm-eval]"
-pip install --no-build-isolation flash-attn==2.6.3
+# Optional: install a Blackwell/CUDA-compatible flash-attn release only when
+# using attn_implementation=flash_attention_2. PyTorch SDPA needs no extra package.
 
 # Data setup
 python setup_data.py --eval # saves/eval now contains evaluation results of the uploaded models
@@ -123,6 +124,16 @@ python setup_data.py --eval # saves/eval now contains evaluation results of the 
 # into `saves/eval`, used for evaluating unlearning across supported benchmarks.
 # Additional datasets (e.g., WMDP) are supported — run below for options:
 # python setup_data.py --help
+```
+
+The base environment uses a CUDA 13 PyTorch wheel and supports NVIDIA
+Blackwell GPUs. DeepSpeed is optional for single-GPU and standard DDP runs.
+Install it only for the provided DeepSpeed/ZeRO configuration, after installing
+a system CUDA toolkit whose major version matches `torch.version.cuda`:
+
+```bash
+pip install -e ".[deepspeed]"
+python -m deepspeed.env_report
 ```
 
 ---
