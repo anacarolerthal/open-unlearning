@@ -1,6 +1,8 @@
-import os
 import json
 import logging
+import numbers
+import os
+
 from evals.metrics import get_metrics
 
 logger = logging.getLogger("evaluator")
@@ -37,7 +39,7 @@ class Evaluator:
         try:
             with open(file, "w") as f:
                 json.dump(logs, f, indent=4)
-        except Exception as e:
+        except (OSError, TypeError, ValueError) as e:
             raise RuntimeError(f"Failed to save {file}: {e}")
 
     def prepare_model(self, model):
@@ -59,6 +61,13 @@ class Evaluator:
             agg_value = metric_results.get("agg_value", None)
             if agg_value is not None:
                 metric_summary[metric_name] = agg_value
+            # Diagnostics and constrained selectors often return several useful
+            # scalars. Preserve the conventional aggregate key while exposing
+            # the remaining scalars to experiment trackers.
+            for key, value in metric_results.items():
+                if key == "agg_value" or not isinstance(value, numbers.Number):
+                    continue
+                metric_summary[f"{metric_name}/{key}"] = value
         return metric_summary
 
     def evaluate(self, model, output_dir=None, overwrite=None, **kwargs):
@@ -96,7 +105,6 @@ class Evaluator:
                 "template_args": kwargs.get("template_args", None),
             }
             metrics_args = self.eval_cfg.metrics[metric_name]
-            _
             result = metric_fn(
                 model,
                 metric_name=metric_name,

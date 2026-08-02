@@ -1,0 +1,15 @@
+# @package eval.tofu.metrics.constrained_selection
+defaults:
+  - .@pre_compute.forget_quality: forget_quality
+  - .@pre_compute.forget_truth_ratio: forget_Truth_Ratio
+  - .@pre_compute.model_utility: model_utility
+
+handler: constrained_selection
+
+# Preservation floors come from the ineffective-head/full-model reference in
+# the diagnostic sweep. Passing forget quality still requires the conventional
+# TOFU KS-test threshold.
+utility_floor: 0.587
+truth_ratio_floor: 0.475
+forget_quality_threshold: 0.05
+log_gap_scale: 20.0

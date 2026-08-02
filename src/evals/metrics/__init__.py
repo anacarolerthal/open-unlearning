@@ -1,29 +1,31 @@
-from typing import Dict
 from omegaconf import DictConfig
+
 from evals.metrics.base import UnlearningMetric
 from evals.metrics.memorization import (
+    exact_memorization,
+    extraction_strength,
     probability,
     probability_w_options,
     rouge,
     truth_ratio,
-    extraction_strength,
-    exact_memorization,
 )
-from evals.metrics.privacy import ks_test, privleak, rel_diff
 from evals.metrics.mia import (
+    mia_gradnorm,
     mia_loss,
     mia_min_k,
     mia_min_k_plus_plus,
-    mia_gradnorm,
-    mia_zlib,
     mia_reference,
+    mia_zlib,
 )
+from evals.metrics.privacy import ks_test, privleak, rel_diff
+from evals.metrics.router import router_activations
 from evals.metrics.utility import (
-    hm_aggregate,
     classifier_prob,
+    constrained_selection,
+    hm_aggregate,
 )
 
-METRICS_REGISTRY: Dict[str, UnlearningMetric] = {}
+METRICS_REGISTRY: dict[str, UnlearningMetric] = {}
 
 
 def _register_metric(metric):
@@ -62,6 +64,7 @@ _register_metric(privleak)
 _register_metric(rel_diff)
 _register_metric(exact_memorization)
 _register_metric(extraction_strength)
+_register_metric(router_activations)
 
 # Register MIA metrics
 _register_metric(mia_loss)
@@ -73,3 +76,4 @@ _register_metric(mia_reference)
 
 # Register Utility metrics
 _register_metric(classifier_prob)
+_register_metric(constrained_selection)

@@ -9,11 +9,17 @@ args:
   max_steps: -1
   optim: adamw_torch
 method_args:
-  rank: 16
+  rank: 32
   lam: 1.0
   epsilon: 0.05
-  calibrate: false # backwards-compatible alias; prefer router_mode=calibrated
   router_mode: calibrated
-  prompt_loss_weight: 1.0
+  objective: independent_ce
+  answer_contrast_weight: 1.0
+  answer_contrast_margin: 0.1
+  direct_beta: 0.1
+  scale_regularization_weight: 1.0e-3
+  normalize_correction: true
+  head_checkpoint: null
+  prompt_loss_weight: 0.1
   diagnostics_max_samples: 128
   save_base_model: false

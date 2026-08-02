@@ -1,0 +1,26 @@
+# @package eval.tofu
+
+# UnlearnHead-specific TOFU profile. Router diagnostics require callbacks that
+# ordinary models and other unlearning trainers do not expose.
+defaults:
+  - tofu_metrics:
+    - forget_Truth_Ratio
+    - forget_quality
+    - forget_Q_A_Prob
+    - forget_Q_A_ROUGE
+    - model_utility
+    - privleak
+    - extraction_strength
+    - forget_Q_A_gibberish
+    - router_activations
+    - constrained_selection
+
+handler: TOFUEvaluator
+output_dir: ${paths.output_dir}
+metrics: {}
+overwrite: false
+forget_split: forget10
+holdout_split: holdout10
+retain_logs_path: null
+question_key: question
+batch_size: 32

@@ -1,0 +1,77 @@
+# @package eval.tofu.metrics.router_activations
+handler: router_activations
+batch_size: ${eval.tofu.batch_size}
+
+collators:
+  DataCollatorForSupervisedDataset:
+    handler: DataCollatorForSupervisedDataset
+    args:
+      padding_side: right
+
+datasets:
+  forget_exact:
+    access_key: forget_exact
+    handler: QADataset
+    args:
+      hf_args:
+        name: ${eval.tofu.forget_split}_perturbed
+        split: train
+        path: locuslab/TOFU
+      question_key: question
+      answer_key: answer
+      max_length: 512
+  forget_paraphrased:
+    access_key: forget_paraphrased
+    handler: QADataset
+    args:
+      hf_args:
+        name: ${eval.tofu.forget_split}_perturbed
+        split: train
+        path: locuslab/TOFU
+      question_key: paraphrased_question
+      answer_key: answer
+      max_length: 512
+  retain:
+    access_key: retain
+    handler: QADataset
+    args:
+      hf_args:
+        name: retain_perturbed
+        split: train
+        path: locuslab/TOFU
+      question_key: question
+      answer_key: answer
+      max_length: 512
+  real_authors:
+    access_key: real_authors
+    handler: QADataset
+    args:
+      hf_args:
+        name: real_authors_perturbed
+        split: train
+        path: locuslab/TOFU
+      question_key: question
+      answer_key: answer
+      max_length: 512
+  world_facts:
+    access_key: world_facts
+    handler: QADataset
+    args:
+      hf_args:
+        name: world_facts_perturbed
+        split: train
+        path: locuslab/TOFU
+      question_key: question
+      answer_key: answer
+      max_length: 512
+  calibration:
+    access_key: calibration
+    handler: QADataset
+    args:
+      hf_args:
+        name: ${eval.tofu.holdout_split}
+        split: train
+        path: locuslab/TOFU
+      question_key: question
+      answer_key: answer
+      max_length: 512

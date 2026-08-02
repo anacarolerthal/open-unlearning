@@ -1,8 +1,10 @@
-import os
 import json
 import logging
-from typing import Callable, Any, Dict
-from data import get_datasets, get_collators
+import os
+from collections.abc import Callable
+from typing import Any
+
+from data import get_collators, get_datasets
 
 logger = logging.getLogger("metrics")
 
@@ -17,7 +19,7 @@ class UnlearningMetric:
         self._metric_fn = metric_fn
         self.data = None
         self.collators = None
-        self.pre_compute_metrics: Dict[str, Callable] = {}
+        self.pre_compute_metrics: dict[str, Callable] = {}
 
     def get_datasets(self, dataset_cfgs=None, **kwargs):
         """Load the datasets from config"""
@@ -39,7 +41,7 @@ class UnlearningMetric:
         )
         return collators
 
-    def set_pre_compute_metrics(self, metrics: Dict[str, Callable]):
+    def set_pre_compute_metrics(self, metrics: dict[str, Callable]):
         self.pre_compute_metrics.update(metrics)
 
     def evaluate_metric(self, model, metric_name, **kwargs):
@@ -58,12 +60,14 @@ class UnlearningMetric:
             raise ValueError(f"{file} doesn't exist!")
         return logs
 
-    def prepare_kwargs_evaluate_metric(self, model, metric_name, cache={}, **kwargs):
+    def prepare_kwargs_evaluate_metric(self, model, metric_name, cache=None, **kwargs):
         """Prepare the kwargs required to call the metric_fn defined by user.
         - Loads datasets, collators, results for pre_compute metrics
         Returns:
             Dict: Updated kwargs with datasets, collators, pre_compute results loaded
         """
+        cache = {} if cache is None else cache
+
         # Load datasets
         dataset_cfgs = kwargs.pop("datasets", None)
         if dataset_cfgs is not None:
@@ -132,9 +136,16 @@ class UnlearningMetric:
         if metric_name in cache:
             logger.info(f"Skipping {metric_name}, already evaluated.")
 
+        set_eval_context = getattr(model, "_unlearn_head_set_eval_context", None)
+        if set_eval_context is not None:
+            set_eval_context(metric_name)
         metric_kwargs = self.prepare_kwargs_evaluate_metric(
             model, metric_name, cache, **kwargs
         )
+        # Recursive pre-computes may have changed the context. Restore it for
+        # the outer metric before invoking its handler.
+        if set_eval_context is not None:
+            set_eval_context(metric_name)
         results = self.evaluate_metric(model, metric_name, **metric_kwargs)
         cache.update({metric_name: results})
         return results
