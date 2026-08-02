@@ -5,6 +5,7 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM, TrainingArguments
 
 from data.unlearn import ForgetRetainDataset
+from evals.metrics.utils import evaluate_probability
 from evals.metrics.utility import constrained_selection
 from trainer.unlearn.unlearn_head import UnlearnHead
 
@@ -168,3 +169,37 @@ def test_evaluation_grid_reuses_each_trained_head():
     assert metrics["eval_grid/best_router_index"] == 1
     assert metrics["eval_grid/lambda_0_spread/model_utility"] == 0
     assert logged[-1]["eval_grid/oracle/best_constrained_selection"] == 1.5
+
+
+def test_probability_evaluation_converts_bfloat16_outputs():
+    class _BFloat16Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16))
+
+        @property
+        def device(self):
+            return self.anchor.device
+
+        def forward(self, input_ids, **kwargs):
+            batch_size, sequence_length = input_ids.shape
+            logits = torch.zeros(
+                batch_size,
+                sequence_length,
+                8,
+                dtype=torch.bfloat16,
+                device=input_ids.device,
+            )
+            return SimpleNamespace(logits=logits)
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "attention_mask": torch.ones(1, 3, dtype=torch.long),
+        "labels": torch.tensor([[-100, 2, 3]]),
+    }
+
+    results = evaluate_probability(_BFloat16Model(), batch)
+
+    assert len(results) == 1
+    assert isinstance(results[0]["avg_loss"], float)
+    assert isinstance(results[0]["prob"], float)

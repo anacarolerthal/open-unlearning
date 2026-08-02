@@ -95,8 +95,11 @@ def evaluate_probability(model, batch):
     avg_losses = losses / num_token_gt
     normalized_probs = torch.exp(-avg_losses)
 
-    avg_losses = avg_losses.cpu().numpy().tolist()
-    normalized_probs = normalized_probs.cpu().numpy().tolist()
+    # NumPy has no native bfloat16 dtype. Probability evaluation can retain
+    # the model's BF16 dtype under SDPA, so cast the scalar outputs before
+    # crossing the PyTorch/NumPy boundary.
+    avg_losses = avg_losses.float().cpu().numpy().tolist()
+    normalized_probs = normalized_probs.float().cpu().numpy().tolist()
     return [
         {"prob": prob, "avg_loss": avg_loss}
         for prob, avg_loss in zip(normalized_probs, avg_losses)
