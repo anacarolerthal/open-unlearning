@@ -46,7 +46,15 @@ class DataCollatorForSupervisedDataset(object):
         else:
             input_ids = [instance["input_ids"] for instance in instances]
             input_ids = self._pad_tokens(input_ids, self.tokenizer.pad_token_id)
-            attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
+            if "attention_mask" in instances[0]:
+                # Preserve the dataset-provided mask. Reconstructing it from
+                # token IDs is incorrect when pad_token_id == eos_token_id:
+                # real EOS/end-of-turn tokens would be treated as padding.
+                attention_mask = self._pad_tokens(
+                    [instance["attention_mask"] for instance in instances], 0
+                )
+            else:
+                attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
             return_dct.update({"input_ids": input_ids})
             return_dct.update({"attention_mask": attention_mask})
             if "labels" in instances[0]:

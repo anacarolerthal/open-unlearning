@@ -41,6 +41,14 @@ class FinetuneTrainer(Trainer):
             run_dir = self._get_output_dir(trial=trial)
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
             output_dir = os.path.join(run_dir, checkpoint_folder, "evals")
+            if metric_key_prefix != "eval":
+                safe_prefix = "".join(
+                    character
+                    if character.isalnum() or character in {"-", "_", "."}
+                    else "_"
+                    for character in metric_key_prefix
+                )
+                output_dir = os.path.join(output_dir, safe_prefix)
             os.makedirs(output_dir, exist_ok=True)
             eval_metrics = {}
             for _, evaluator in self.evaluators.items():

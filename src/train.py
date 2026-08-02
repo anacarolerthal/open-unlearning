@@ -62,7 +62,10 @@ def main(cfg: DictConfig):
         trainer.save_model(trainer_args.output_dir)
 
     if trainer_args.do_eval:
-        trainer.evaluate(metric_key_prefix="eval")
+        if getattr(trainer, "has_evaluation_grid", False):
+            trainer.evaluate_grid()
+        else:
+            trainer.evaluate(metric_key_prefix="eval")
 
 
 if __name__ == "__main__":

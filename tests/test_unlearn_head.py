@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM, TrainingArguments
@@ -123,3 +125,46 @@ def test_oracle_routing_uses_metric_context():
 
     trainer._eval_metric_name = "retain_Q_A_Prob"
     assert torch.equal(trainer._routing_alpha(scores), torch.zeros_like(scores))
+
+
+def test_evaluation_grid_reuses_each_trained_head():
+    trainer = SimpleNamespace(
+        lam=1.0,
+        router_mode="calibrated",
+        eval_lambdas=(0.0, 0.5),
+        eval_router_modes=("calibrated", "oracle"),
+        has_evaluation_grid=True,
+        _lambda_label=UnlearnHead._lambda_label,
+    )
+    calls = []
+    logged = []
+
+    def fake_evaluate(**kwargs):
+        prefix = kwargs["metric_key_prefix"]
+        calls.append((trainer.lam, trainer.router_mode, prefix))
+        score = trainer.lam + (trainer.router_mode == "oracle")
+        return {
+            f"{prefix}_constrained_selection": score,
+            f"{prefix}_constrained_selection/feasible": float(score > 1),
+            f"{prefix}_model_utility": 0.6,
+            f"{prefix}_forget_truth_ratio": 0.5,
+            f"{prefix}_forget_quality": 0.1,
+            f"{prefix}_forget_Q_A_Prob": 0.4,
+            f"{prefix}_forget_Q_A_ROUGE": 0.3,
+        }
+
+    trainer.evaluate = fake_evaluate
+    trainer.log = logged.append
+
+    metrics = UnlearnHead.evaluate_grid(trainer)
+
+    assert len(calls) == 4
+    assert trainer.lam == 1.0
+    assert trainer.router_mode == "calibrated"
+    assert metrics["eval_grid/num_points"] == 4
+    assert metrics["eval_grid/feasible_points"] == 1
+    assert metrics["eval_grid/best_constrained_selection"] == 1.5
+    assert metrics["eval_grid/best_lambda"] == 0.5
+    assert metrics["eval_grid/best_router_index"] == 1
+    assert metrics["eval_grid/lambda_0_spread/model_utility"] == 0
+    assert logged[-1]["eval_grid/oracle/best_constrained_selection"] == 1.5

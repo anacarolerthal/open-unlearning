@@ -107,6 +107,8 @@ class UnlearnHead(UnlearnTrainer):
         prompt_loss_weight=0.1,
         diagnostics_max_samples=128,
         save_base_model=False,
+        eval_lambdas=None,
+        eval_router_modes=None,
         *args,
         **kwargs,
     ):
@@ -141,6 +143,30 @@ class UnlearnHead(UnlearnTrainer):
             raise ValueError("scale_regularization_weight must be non-negative")
         if not isinstance(diagnostics_max_samples, int) or diagnostics_max_samples <= 0:
             raise ValueError("diagnostics_max_samples must be a positive integer")
+        if (eval_lambdas is None) != (eval_router_modes is None):
+            raise ValueError(
+                "eval_lambdas and eval_router_modes must be configured together"
+            )
+        if eval_lambdas is None:
+            eval_lambdas = ()
+            eval_router_modes = ()
+        else:
+            eval_lambdas = tuple(float(value) for value in eval_lambdas)
+            eval_router_modes = tuple(str(value) for value in eval_router_modes)
+            if not eval_lambdas or not eval_router_modes:
+                raise ValueError("the UnlearnHead evaluation grid cannot be empty")
+            if any(not math.isfinite(value) or value < 0 for value in eval_lambdas):
+                raise ValueError("eval_lambdas must contain finite non-negative values")
+            invalid_modes = set(eval_router_modes) - set(self.ROUTER_MODES)
+            if invalid_modes:
+                raise ValueError(
+                    "eval_router_modes contains unsupported modes: "
+                    f"{sorted(invalid_modes)}"
+                )
+            if len(set(eval_lambdas)) != len(eval_lambdas):
+                raise ValueError("eval_lambdas must not contain duplicates")
+            if len(set(eval_router_modes)) != len(eval_router_modes):
+                raise ValueError("eval_router_modes must not contain duplicates")
 
         super().__init__(*args, **kwargs)
         self.model_accepts_loss_kwargs = False
@@ -158,6 +184,8 @@ class UnlearnHead(UnlearnTrainer):
         self.prompt_loss_weight = prompt_loss_weight
         self.diagnostics_max_samples = diagnostics_max_samples
         self.save_base_model = save_base_model
+        self.eval_lambdas = eval_lambdas
+        self.eval_router_modes = eval_router_modes
         self.tau = None
         self.correction_scale = None if normalize_correction else 1.0
         self._eval_metric_name = None
@@ -749,6 +777,110 @@ class UnlearnHead(UnlearnTrainer):
         scores = self._prompt_score(input_ids, attention_mask, labels)
         activations = scores > self.tau
         return scores, activations
+
+    @property
+    def has_evaluation_grid(self):
+        return bool(self.eval_lambdas and self.eval_router_modes)
+
+    @staticmethod
+    def _lambda_label(value):
+        return format(value, ".8g").replace("-", "m").replace(".", "p")
+
+    def evaluate_grid(self, eval_dataset=None, ignore_keys=None, trial=None):
+        """Evaluate one trained head over inference-only lambda/router choices.
+
+        Keeping the grid inside a training run avoids fitting the identical
+        low-rank head once for every inference-time operating point. Every
+        point gets a distinct metric namespace and on-disk evaluation folder.
+        """
+        if not self.has_evaluation_grid:
+            raise RuntimeError("UnlearnHead evaluation grid is not configured")
+
+        original_lam = self.lam
+        original_router_mode = self.router_mode
+        all_metrics = {}
+        point_summaries = []
+        try:
+            for lam in self.eval_lambdas:
+                for router_mode in self.eval_router_modes:
+                    self.lam = lam
+                    self.router_mode = router_mode
+                    prefix = f"eval_grid/{router_mode}/lambda_{self._lambda_label(lam)}"
+                    metrics = self.evaluate(
+                        eval_dataset=eval_dataset,
+                        ignore_keys=ignore_keys,
+                        metric_key_prefix=prefix,
+                        trial=trial,
+                    )
+                    all_metrics.update(metrics)
+                    score = metrics.get(f"{prefix}_constrained_selection")
+                    feasible = metrics.get(
+                        f"{prefix}_constrained_selection/feasible", 0.0
+                    )
+                    if isinstance(score, (int, float)) and math.isfinite(score):
+                        point_summaries.append(
+                            {
+                                "lam": lam,
+                                "router_mode": router_mode,
+                                "score": float(score),
+                                "feasible": float(feasible),
+                            }
+                        )
+        finally:
+            self.lam = original_lam
+            self.router_mode = original_router_mode
+
+        aggregate = {
+            "eval_grid/num_points": len(self.eval_lambdas)
+            * len(self.eval_router_modes),
+            "eval_grid/feasible_points": sum(
+                point["feasible"] > 0 for point in point_summaries
+            ),
+        }
+        if point_summaries:
+            best = max(point_summaries, key=lambda point: point["score"])
+            aggregate.update(
+                {
+                    "eval_grid/best_constrained_selection": best["score"],
+                    "eval_grid/best_lambda": best["lam"],
+                    "eval_grid/best_router_index": self.eval_router_modes.index(
+                        best["router_mode"]
+                    ),
+                }
+            )
+            for router_mode in self.eval_router_modes:
+                mode_points = [
+                    point
+                    for point in point_summaries
+                    if point["router_mode"] == router_mode
+                ]
+                if mode_points:
+                    aggregate[f"eval_grid/{router_mode}/best_constrained_selection"] = (
+                        max(point["score"] for point in mode_points)
+                    )
+
+        lambda_zero_metrics = {}
+        for router_mode in self.eval_router_modes:
+            prefix = f"eval_grid/{router_mode}/lambda_0"
+            for metric_name in (
+                "forget_quality",
+                "forget_truth_ratio",
+                "model_utility",
+                "forget_Q_A_Prob",
+                "forget_Q_A_ROUGE",
+            ):
+                value = all_metrics.get(f"{prefix}_{metric_name}")
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    lambda_zero_metrics.setdefault(metric_name, []).append(float(value))
+        for metric_name, values in lambda_zero_metrics.items():
+            if len(values) > 1:
+                aggregate[f"eval_grid/lambda_0_spread/{metric_name}"] = max(
+                    values
+                ) - min(values)
+
+        self.log(aggregate)
+        all_metrics.update(aggregate)
+        return all_metrics
 
     def evaluate(
         self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval", trial=None

@@ -23,3 +23,7 @@ method_args:
   prompt_loss_weight: 0.1
   diagnostics_max_samples: 128
   save_base_model: false
+  # When both lists are set, train once and evaluate every inference-only
+  # lambda/router combination in the same run.
+  eval_lambdas: null
+  eval_router_modes: null
