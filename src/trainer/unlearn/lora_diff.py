@@ -147,7 +147,11 @@ class LoraDiff(UnlearnTrainer):
             return original_generate(*args, **kwargs)
 
         def correction_hook(module, args, kwargs, output):
-            if self._computing_adapter_logits or not self._is_forget:
+            if (
+                self._computing_adapter_logits
+                or not self._is_forget
+                or getattr(output, "_lora_diff_corrected", False)
+            ):
                 return output
 
             branch_kwargs = dict(kwargs)
@@ -171,11 +175,16 @@ class LoraDiff(UnlearnTrainer):
             )
             if labels is not None:
                 output.loss = self._causal_lm_loss(output.logits, labels)
+            output._lora_diff_corrected = True
             return output
 
-        handle = base_model.register_forward_hook(
-            correction_hook, with_kwargs=True
-        )
+        # PEFT forward() bypasses hooks on the wrapped model, while generate()
+        # bypasses hooks on the PEFT wrapper. Cover both paths; the marker above
+        # prevents a correction from being applied twice.
+        handles = [
+            self.model.register_forward_hook(correction_hook, with_kwargs=True),
+            base_model.register_forward_hook(correction_hook, with_kwargs=True),
+        ]
 
         # Recomputing the complete prefix keeps all-linear LoRA generation
         # correct without maintaining three separate KV caches.
@@ -184,7 +193,8 @@ class LoraDiff(UnlearnTrainer):
             with self.model.disable_adapter():
                 yield
         finally:
-            handle.remove()
+            for handle in handles:
+                handle.remove()
             self.model.generate = original_generate
             self.model.base_model.set_adapter(previous_adapters)
 
