@@ -15,6 +15,8 @@ parameters:
     values: [8, 16, 32]
   trainer.method_args.lam:
     values: [0.5, 1.0]
+  trainer.method_args.classifier:
+    values: [likelihood_ratio, oracle]
   trainer.args.num_train_epochs:
     values: [5, 10]
   trainer.args.per_device_train_batch_size:
@@ -40,5 +42,5 @@ command:
   - trainer.args.report_to=wandb
   - trainer.args.eval_strategy=no
   - trainer.args.eval_on_start=False
-  - task_name=sweep_unlearn_head_lr${trainer.args.learning_rate}_rank${trainer.method_args.rank}_lam${trainer.method_args.lam}_ep${trainer.args.num_train_epochs}_bs${trainer.args.per_device_train_batch_size}_${oc.env:WANDB_RUN_ID}
+  - task_name=sweep_unlearn_head_lr${trainer.args.learning_rate}_rank${trainer.method_args.rank}_lam${trainer.method_args.lam}_classifier${trainer.method_args.classifier}_ep${trainer.args.num_train_epochs}_bs${trainer.args.per_device_train_batch_size}_${oc.env:WANDB_RUN_ID}
   - ${args_no_hyphens}

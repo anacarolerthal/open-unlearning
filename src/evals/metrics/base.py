@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+from contextlib import nullcontext
 from typing import Callable, Any, Dict
 from data import get_datasets, get_collators
 
@@ -44,7 +45,16 @@ class UnlearningMetric:
 
     def evaluate_metric(self, model, metric_name, **kwargs):
         logger.info(f"Evaluating {metric_name}")
-        results = self._metric_fn(model, **kwargs)
+        data = kwargs.get("data")
+        origin = getattr(data, "unlearn_origin", None)
+        classifier_context = getattr(model, "unlearn_classifier_context", None)
+        context = (
+            classifier_context(origin)
+            if callable(classifier_context) and origin is not None
+            else nullcontext()
+        )
+        with context:
+            results = self._metric_fn(model, **kwargs)
         return results
 
     def load_logs_from_file(self, file):
@@ -58,12 +68,15 @@ class UnlearningMetric:
             raise ValueError(f"{file} doesn't exist!")
         return logs
 
-    def prepare_kwargs_evaluate_metric(self, model, metric_name, cache={}, **kwargs):
+    def prepare_kwargs_evaluate_metric(self, model, metric_name, cache=None, **kwargs):
         """Prepare the kwargs required to call the metric_fn defined by user.
         - Loads datasets, collators, results for pre_compute metrics
         Returns:
             Dict: Updated kwargs with datasets, collators, pre_compute results loaded
         """
+        if cache is None:
+            cache = {}
+
         # Load datasets
         dataset_cfgs = kwargs.pop("datasets", None)
         if dataset_cfgs is not None:

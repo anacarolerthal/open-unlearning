@@ -8,7 +8,7 @@ from evals.metrics.mia.gradnorm import GradNormAttack
 
 from sklearn.metrics import roc_auc_score
 
-
+from contextlib import nullcontext
 import numpy as np
 
 
@@ -51,9 +51,21 @@ def mia_auc(attack_cls, model, data, collator, batch_size, **kwargs):
     }
     attack_args.update(kwargs)
 
+    classifier_context = getattr(model, "unlearn_classifier_context", None)
+
+    def evaluate_split(split):
+        origin = getattr(data[split], "unlearn_origin", None)
+        context = (
+            classifier_context(origin)
+            if callable(classifier_context) and origin is not None
+            else nullcontext()
+        )
+        with context:
+            return attack_cls(data=data[split], **attack_args).attack()
+
     output = {
-        "forget": attack_cls(data=data["forget"], **attack_args).attack(),
-        "holdout": attack_cls(data=data["holdout"], **attack_args).attack(),
+        "forget": evaluate_split("forget"),
+        "holdout": evaluate_split("holdout"),
     }
     forget_scores = [
         elem["score"] for elem in output["forget"]["value_by_index"].values()

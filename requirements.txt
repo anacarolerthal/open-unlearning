@@ -1,5 +1,6 @@
 huggingface-hub==0.36.0
 transformers==4.51.3
+peft==0.15.2
 hf-xet==1.2.0
 numpy==2.2.3
 hydra-core==1.3

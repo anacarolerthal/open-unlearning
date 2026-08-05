@@ -1,129 +1,187 @@
-import os
 import statistics
+from contextlib import contextmanager
+from copy import deepcopy
+from math import isnan
+from typing import ClassVar
 
 import torch
-from torch import nn
 import torch.nn.functional as F
-from transformers import TrainerCallback
-from transformers.modeling_outputs import CausalLMOutput
+from peft import LoraConfig, TaskType, get_peft_model
 
 from trainer.unlearn.base import UnlearnTrainer
 
 
 def _safe_mean(values):
-    values = [v for v in values if v == v]  # drop NaNs
+    values = [v for v in values if not isnan(v)]
     return statistics.fmean(values) if values else float("nan")
 
 
 def _fraction_above(values, threshold):
-    values = [v for v in values if v == v]
-    return sum(1 for v in values if v > threshold) / len(values) if values else float("nan")
+    values = [v for v in values if not isnan(v)]
+    return (
+        sum(1 for v in values if v > threshold) / len(values)
+        if values
+        else float("nan")
+    )
 
 
-class LowRankHead(nn.Module):
-    """B @ (A @ h); B zero-initialized so the head starts as a no-op."""
+class _HookGroup:
+    def __init__(self, handles, cleanup=None):
+        self.handles = handles
+        self.cleanup = cleanup
 
-    def __init__(self, hidden_size, vocab_size, rank):
-        super().__init__()
-        self.A = nn.Linear(hidden_size, rank, bias=False)
-        self.B = nn.Linear(rank, vocab_size, bias=False)
-        nn.init.zeros_(self.B.weight)
-
-    def forward(self, h):
-        h = h.to(dtype=self.A.weight.dtype)
-        return self.B(self.A(h))
-
-
-class _HeadOptimizerCallback(TrainerCallback):
-    """HF's built-in clipping only covers self.model.parameters() (frozen);
-    this clips the actual trainable heads, since max_grad_norm otherwise
-    silently does nothing for them. Trainer also clears gradients through
-    model.zero_grad(), so the external heads need to be cleared explicitly
-    after each optimizer step."""
-
-    def __init__(self, trainer):
-        self.trainer = trainer
-
-    def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        if args.max_grad_norm and args.max_grad_norm > 0:
-            head_params = list(self.trainer.forget_head.parameters()) + list(
-                self.trainer.retain_head.parameters()
-            )
-            nn.utils.clip_grad_norm_(head_params, args.max_grad_norm)
-
-    def on_step_end(self, args, state, control, **kwargs):
-        self.trainer.forget_head.zero_grad(set_to_none=True)
-        self.trainer.retain_head.zero_grad(set_to_none=True)
+    def remove(self):
+        for handle in self.handles:
+            handle.remove()
+        if self.cleanup is not None:
+            self.cleanup()
 
 
 class UnlearnHead(UnlearnTrainer):
-    """Single-request UnlearnHead: two low-rank heads on a frozen backbone,
-    gated at inference by a forget/retain likelihood-ratio router.
+    """Two Hugging Face PEFT all-linear LoRA adapters on a frozen model.
 
-    By default (calibrate=False) the router uses a fixed tau=0: the gate
-    opens whenever the forget head finds a prompt more likely than the
-    retain head does, no calibration pass needed. Set calibrate=True to
-    instead pick tau from a target false-positive rate (epsilon) on the
-    retain set, via _calibrate() (unused by default, kept for later use).
+    The historical handler name is retained for config compatibility, but the
+    method no longer trains vocabulary heads. A forget adapter and a retain
+    adapter each specialize the complete frozen model. At inference their
+    logit contrast is subtracted from the base logits.
+
+    ``classifier="likelihood_ratio"`` uses the original prompt likelihood
+    router. ``classifier="oracle"`` uses evaluator-provided dataset provenance
+    and therefore activates exactly for forget examples.
     """
+
+    CLASSIFIERS: ClassVar[frozenset[str]] = frozenset(
+        {"likelihood_ratio", "oracle"}
+    )
 
     def __init__(
         self,
         rank=16,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
         lam=1.0,
+        classifier="likelihood_ratio",
         epsilon=0.05,
         calibrate=False,
         prompt_loss_weight=1.0,
         diagnostics_max_samples=128,
+        model=None,
         *args,
         **kwargs,
     ):
         if not isinstance(rank, int) or rank <= 0:
             raise ValueError(f"rank must be a positive integer, got {rank!r}")
+        if lora_alpha <= 0:
+            raise ValueError(f"lora_alpha must be positive, got {lora_alpha}")
+        if not 0 <= lora_dropout < 1:
+            raise ValueError(f"lora_dropout must be in [0, 1), got {lora_dropout}")
         if lam < 0:
             raise ValueError(f"lam must be non-negative, got {lam}")
+        if classifier not in self.CLASSIFIERS:
+            raise ValueError(
+                f"classifier must be one of {sorted(self.CLASSIFIERS)}, "
+                f"got {classifier!r}"
+            )
+        if classifier == "oracle" and calibrate:
+            raise ValueError("calibrate is not applicable to the oracle classifier")
         if not 0 <= epsilon <= 1:
             raise ValueError(f"epsilon must be in [0, 1], got {epsilon}")
         if prompt_loss_weight < 0:
             raise ValueError("prompt_loss_weight must be non-negative")
         if not isinstance(diagnostics_max_samples, int) or diagnostics_max_samples <= 0:
+            raise ValueError("diagnostics_max_samples must be a positive integer")
+
+        if model is None:
+            raise ValueError("model must be provided")
+        if hasattr(model, "peft_config"):
             raise ValueError(
-                "diagnostics_max_samples must be a positive integer"
+                "UnlearnHead expects an unwrapped base model, not an existing "
+                "PEFT model."
             )
-        super().__init__(*args, **kwargs)
+
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            bias="none",
+            target_modules="all-linear",
+        )
+        model = get_peft_model(
+            model, lora_config, adapter_name="forget"
+        )
+        model.add_adapter("retain", deepcopy(lora_config))
+        # PEFT requires all trainable adapters to be active before Trainer
+        # creates its optimizer. Individual forwards still select one adapter.
+        model.base_model.set_adapter(["forget", "retain"])
+
+        super().__init__(*args, model=model, **kwargs)
+        if not self.label_names:
+            self.label_names = ["labels"]
         # The custom loss is already token-normalized and does not consume
         # model loss kwargs. This restores Trainer's gradient-accumulation
         # scaling for models such as Llama whose forward accepts **kwargs.
         self.model_accepts_loss_kwargs = False
-        self.rank = rank
         self.lam = lam
+        self.classifier = classifier
         self.epsilon = epsilon
         self.calibrate = calibrate
         self.prompt_loss_weight = prompt_loss_weight
         self.diagnostics_max_samples = diagnostics_max_samples
-        self.tau = None if calibrate else 0.0
+        if classifier == "oracle":
+            self.tau = 0.5
+        else:
+            self.tau = None if calibrate else 0.0
         self._answer_loss_sum = 0.0
         self._answer_loss_count = 0
+        self._oracle_mask = None
+        self._inside_correction_branch = False
+        self._adapters_trained = False
 
-        for p in self.model.parameters():
-            p.requires_grad = False
-        self.model.eval()
+        # Metrics execute directly against the model. Exposing this context
+        # manager lets the evaluator supply the provenance required by the
+        # oracle classifier without adding unsupported kwargs to model.forward.
+        self.model.unlearn_classifier_context = self.classifier_context
 
-        # Trainer attributes, not submodules of self.model, so self.model's
-        # save_pretrained stays a plain reloadable base-model checkpoint.
-        base_param = next(self.model.parameters())
-        self.forget_head = LowRankHead(
-            self.model.config.hidden_size, self.model.config.vocab_size, rank
-        ).to(device=base_param.device)
-        self.retain_head = LowRankHead(
-            self.model.config.hidden_size, self.model.config.vocab_size, rank
-        ).to(device=base_param.device)
-        self.add_callback(_HeadOptimizerCallback(self))
-
-        # Diagnostics/calibration run on the training data itself (as TOFU
-        # eval does), not a held-out slice.
         self.retain_cal = getattr(self.train_dataset, "retain", None)
         self.forget_cal = getattr(self.train_dataset, "forget", None)
+
+    @contextmanager
+    def _using_adapter(self, adapter_name):
+        if adapter_name not in (None, "forget", "retain"):
+            raise ValueError(f"Unknown adapter {adapter_name!r}")
+        if adapter_name is None:
+            with self.model.disable_adapter():
+                yield
+            return
+
+        previous = list(self.model.active_adapters)
+        self.model.set_adapter(adapter_name)
+        try:
+            yield
+        finally:
+            if len(previous) == 1:
+                self.model.set_adapter(previous[0])
+            else:
+                self.model.base_model.set_adapter(previous)
+
+    @contextmanager
+    def classifier_context(self, is_forget):
+        """Temporarily provide dataset provenance to the oracle classifier."""
+        previous = self._oracle_mask
+        if is_forget is None:
+            self._oracle_mask = None
+        elif torch.is_tensor(is_forget):
+            self._oracle_mask = is_forget.detach().to(dtype=torch.bool)
+        elif isinstance(is_forget, (list, tuple)):
+            self._oracle_mask = torch.tensor(is_forget, dtype=torch.bool)
+        else:
+            self._oracle_mask = torch.tensor([bool(is_forget)], dtype=torch.bool)
+        try:
+            yield
+        finally:
+            self._oracle_mask = previous
 
     def log(self, logs, start_time=None):
         if self._answer_loss_count:
@@ -134,41 +192,14 @@ class UnlearnHead(UnlearnTrainer):
             self._answer_loss_count = 0
         super().log(logs, start_time)
 
-    def create_optimizer(self):
-        if self.optimizer is None:
-            head_params = list(self.forget_head.parameters()) + list(
-                self.retain_head.parameters()
-            )
-            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(
-                self.args
-            )
-            self.optimizer = optimizer_cls(head_params, **optimizer_kwargs)
-        return self.optimizer
-
-    @staticmethod
-    def _base_logits_and_hidden(model, input_ids, attention_mask):
-        """Run only the frozen backbone and output projection."""
-        model.eval()
-        base_model = getattr(model, model.base_model_prefix)
-        output_embeddings = model.get_output_embeddings()
-        if output_embeddings is None:
-            raise RuntimeError(
-                "UnlearnHead requires a model with output embeddings."
-            )
-        with torch.no_grad():
-            base_out = base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+    def _adapter_outputs(self, model, inputs, adapter_name):
+        with self._using_adapter(adapter_name):
+            return model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
                 use_cache=False,
                 return_dict=True,
             )
-            h = base_out.last_hidden_state
-            z0 = output_embeddings(h)
-        return z0, h
-
-    def _head_outputs(self, model, input_ids, attention_mask, head):
-        z0, h = self._base_logits_and_hidden(model, input_ids, attention_mask)
-        return CausalLMOutput(logits=z0 + head(h))
 
     @staticmethod
     def _ce_loss(logits, labels):
@@ -191,12 +222,7 @@ class UnlearnHead(UnlearnTrainer):
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
         forget_inputs = inputs["forget"]
-        forget_outputs = self._head_outputs(
-            model,
-            forget_inputs["input_ids"],
-            forget_inputs["attention_mask"],
-            self.forget_head,
-        )
+        forget_outputs = self._adapter_outputs(model, forget_inputs, "forget")
         forget_answer_loss = self._ce_loss(
             forget_outputs.logits, forget_inputs["labels"]
         )
@@ -208,12 +234,7 @@ class UnlearnHead(UnlearnTrainer):
         forget_prompt_loss = self._ce_loss(forget_outputs.logits, forget_prompt_labels)
 
         retain_inputs = inputs["retain"]
-        retain_outputs = self._head_outputs(
-            model,
-            retain_inputs["input_ids"],
-            retain_inputs["attention_mask"],
-            self.retain_head,
-        )
+        retain_outputs = self._adapter_outputs(model, retain_inputs, "retain")
         retain_answer_loss = self._ce_loss(
             retain_outputs.logits, retain_inputs["labels"]
         )
@@ -226,9 +247,7 @@ class UnlearnHead(UnlearnTrainer):
 
         answer_loss = forget_answer_loss + retain_answer_loss
         prompt_loss = forget_prompt_loss + retain_prompt_loss
-        loss = (
-            answer_loss + self.prompt_loss_weight * prompt_loss
-        ) / (
+        loss = (answer_loss + self.prompt_loss_weight * prompt_loss) / (
             1.0 + self.prompt_loss_weight
         )
 
@@ -237,82 +256,117 @@ class UnlearnHead(UnlearnTrainer):
 
         return (loss, forget_outputs) if return_outputs else loss
 
-    def _frozen_logits(self, input_ids, attention_mask):
-        """One frozen backbone forward + both heads; no gradients."""
+    def _all_logits(self, input_ids, attention_mask):
+        """Run the frozen base, forget adapter, and retain adapter."""
+        inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
         with torch.no_grad():
-            z0, h = self._base_logits_and_hidden(self.model, input_ids, attention_mask)
-            zF = z0 + self.forget_head(h)
-            zR = z0 + self.retain_head(h)
-        return z0, zF, zR
+            z0 = self._adapter_outputs(self.model, inputs, None).logits
+            zf = self._adapter_outputs(self.model, inputs, "forget").logits
+            zr = self._adapter_outputs(self.model, inputs, "retain").logits
+        return z0, zf, zr
 
     @staticmethod
     def _masked_ratio(tok_forget_logp, tok_retain_logp, mask):
-        """Per-row mean of (tok_forget_logp - tok_retain_logp) over `mask`."""
+        """Per-row mean of log p_forget - log p_retain over ``mask``."""
         diff = tok_forget_logp - tok_retain_logp
         counts = mask.sum(dim=-1).clamp(min=1)
-        return (diff * mask).sum(dim=-1) / counts  # 0 where a row has no masked tokens
+        return (diff * mask).sum(dim=-1) / counts
 
-    def _token_logp(self, logits, next_tokens):
+    @staticmethod
+    def _token_logp(logits, next_tokens):
         logp = F.log_softmax(logits, dim=-1)
         return logp[..., :-1, :].gather(-1, next_tokens.unsqueeze(-1)).squeeze(-1)
 
-    def _prompt_score(self, input_ids, attention_mask, labels):
-        """s(q) per example: avg log p_F - log p_R over prompt tokens. Shape [batch]."""
-        _, zF, zR = self._frozen_logits(input_ids, attention_mask)
+    def _likelihood_ratio_score(self, input_ids, attention_mask, labels, zf, zr):
         next_tokens = input_ids[..., 1:]
-        tokF, tokR = self._token_logp(zF, next_tokens), self._token_logp(zR, next_tokens)
+        tokf = self._token_logp(zf, next_tokens)
+        tokr = self._token_logp(zr, next_tokens)
         prompt_mask = (labels[..., 1:] == -100) & (attention_mask[..., 1:] == 1)
-        return self._masked_ratio(tokF, tokR, prompt_mask)
+        return self._masked_ratio(tokf, tokr, prompt_mask)
 
-    def _example_metrics(self, item, head_name):
-        """s(q), NLL under z0/z_head/z_U-gated for one sampled example."""
+    def _prompt_score(self, input_ids, attention_mask, labels):
+        _, zf, zr = self._all_logits(input_ids, attention_mask)
+        return self._likelihood_ratio_score(input_ids, attention_mask, labels, zf, zr)
+
+    def _oracle_scores(self, batch_size, device):
+        if self._oracle_mask is None:
+            raise RuntimeError(
+                "The oracle classifier needs example provenance. Evaluator datasets "
+                "provide it automatically; pass is_forget to "
+                "generate_with_correction() for manual generation."
+            )
+        scores = self._oracle_mask.to(device=device, dtype=torch.float32).flatten()
+        if scores.numel() == 1 and batch_size != 1:
+            scores = scores.expand(batch_size)
+        if scores.numel() != batch_size:
+            raise RuntimeError(
+                "Oracle labels do not match the model batch size. Beam search is "
+                "not supported; use num_beams=1."
+            )
+        return scores
+
+    def _classifier_scores(self, input_ids, attention_mask, labels, zf, zr):
+        if self.classifier == "oracle":
+            return self._oracle_scores(input_ids.shape[0], zf.device)
+        return self._likelihood_ratio_score(input_ids, attention_mask, labels, zf, zr)
+
+    def _classifier_alpha(self, scores):
+        return torch.where(
+            scores > self.tau,
+            torch.full_like(scores, self.lam),
+            torch.zeros_like(scores),
+        )
+
+    def _example_metrics(self, item, adapter_name, is_forget):
+        """Classifier score and answer NLLs for one sampled example."""
         device = next(self.model.parameters()).device
         input_ids = item["input_ids"].to(device).unsqueeze(0)
         attention_mask = item["attention_mask"].to(device).unsqueeze(0)
         labels = item["labels"].to(device).unsqueeze(0)
 
-        z0, zF, zR = self._frozen_logits(input_ids, attention_mask)
+        z0, zf, zr = self._all_logits(input_ids, attention_mask)
         next_tokens = input_ids[..., 1:]
         tok0 = self._token_logp(z0, next_tokens)
-        tokF = self._token_logp(zF, next_tokens)
-        tokR = self._token_logp(zR, next_tokens)
+        tokf = self._token_logp(zf, next_tokens)
+        tokr = self._token_logp(zr, next_tokens)
 
         valid = attention_mask[..., 1:] == 1
-        prompt_mask = (labels[..., 1:] == -100) & valid
         answer_mask = (labels[..., 1:] != -100) & valid
 
-        def masked_mean(t, mask):
-            vals = t[mask]
-            return vals.mean().item() if vals.numel() > 0 else float("nan")
+        def masked_mean(values, mask):
+            selected = values[mask]
+            return selected.mean().item() if selected.numel() else float("nan")
 
-        score = self._masked_ratio(tokF, tokR, prompt_mask).item()
-
-        tok_head = tokF if head_name == "forget" else tokR
-        nll_z0 = -masked_mean(tok0, answer_mask)
-        nll_head = -masked_mean(tok_head, answer_mask)
-
+        with self.classifier_context(is_forget):
+            score = self._classifier_scores(
+                input_ids, attention_mask, labels, zf, zr
+            ).item()
         alpha = self.lam if score > self.tau else 0.0
-        zU = z0 - alpha * (zF - zR)
-        nll_gated = -masked_mean(self._token_logp(zU, next_tokens), answer_mask)
+        zu = z0 - alpha * (zf - zr)
 
+        adapter_tokens = tokf if adapter_name == "forget" else tokr
         return {
             "score": score,
-            "nll_z0": nll_z0,
-            "nll_head": nll_head,
-            "nll_gated": nll_gated,
+            "nll_z0": -masked_mean(tok0, answer_mask),
+            "nll_adapter": -masked_mean(adapter_tokens, answer_mask),
+            "nll_gated": -masked_mean(self._token_logp(zu, next_tokens), answer_mask),
         }
 
     def _calibrate(self):
+        if self.classifier != "likelihood_ratio":
+            raise RuntimeError("Only the likelihood-ratio classifier is calibrated")
         self.model.eval()
         device = next(self.model.parameters()).device
         scores = []
         with torch.no_grad():
-            for i in range(len(self.retain_cal)):
-                item = self.retain_cal[i]
+            for index in range(len(self.retain_cal)):
+                item = self.retain_cal[index]
                 input_ids = item["input_ids"].to(device).unsqueeze(0)
                 attention_mask = item["attention_mask"].to(device).unsqueeze(0)
                 labels = item["labels"].to(device).unsqueeze(0)
-                scores.append(self._prompt_score(input_ids, attention_mask, labels).item())
+                scores.append(
+                    self._prompt_score(input_ids, attention_mask, labels).item()
+                )
         scores = torch.tensor(scores)
         self.tau = torch.quantile(scores, 1 - self.epsilon).item()
         self.log({"unlearn_head/tau": self.tau})
@@ -326,100 +380,154 @@ class UnlearnHead(UnlearnTrainer):
         return permutation[: self.diagnostics_max_samples].tolist()
 
     def _log_diagnostics(self):
-        """Router/head/gated diagnostics on a bounded training-data sample."""
+        """Classifier, adapter, and corrected-model diagnostics."""
         self.model.eval()
-        forget_indices = self._diagnostic_indices(self.forget_cal)
-        retain_indices = self._diagnostic_indices(self.retain_cal)
         forget_metrics = [
-            self._example_metrics(self.forget_cal[i], "forget")
-            for i in forget_indices
+            self._example_metrics(self.forget_cal[index], "forget", True)
+            for index in self._diagnostic_indices(self.forget_cal)
         ]
         retain_metrics = [
-            self._example_metrics(self.retain_cal[i], "retain")
-            for i in retain_indices
+            self._example_metrics(self.retain_cal[index], "retain", False)
+            for index in self._diagnostic_indices(self.retain_cal)
         ]
 
-        forget_scores = [m["score"] for m in forget_metrics]
-        retain_scores = [m["score"] for m in retain_metrics]
-
-        forget_nll_z0 = _safe_mean([m["nll_z0"] for m in forget_metrics])
-        forget_nll_zF = _safe_mean([m["nll_head"] for m in forget_metrics])
-        retain_nll_z0 = _safe_mean([m["nll_z0"] for m in retain_metrics])
-        retain_nll_zR = _safe_mean([m["nll_head"] for m in retain_metrics])
+        forget_scores = [metric["score"] for metric in forget_metrics]
+        retain_scores = [metric["score"] for metric in retain_metrics]
+        forget_nll_z0 = _safe_mean([metric["nll_z0"] for metric in forget_metrics])
+        forget_nll_zf = _safe_mean([metric["nll_adapter"] for metric in forget_metrics])
+        retain_nll_z0 = _safe_mean([metric["nll_z0"] for metric in retain_metrics])
+        retain_nll_zr = _safe_mean([metric["nll_adapter"] for metric in retain_metrics])
 
         metrics = {
-            # Sanity checks
-            "unlearn_head/router_score_mean_forget": _safe_mean(forget_scores),
-            "unlearn_head/router_score_mean_retain": _safe_mean(retain_scores),
-            # Router metrics: is the classifier good, independent of the heads?
-            "unlearn_head/router_tpr_at_tau": _fraction_above(forget_scores, self.tau),
-            "unlearn_head/router_fpr_at_tau": _fraction_above(retain_scores, self.tau),
-            # Head metrics: do the heads edit logits enough, gate forced open?
-            "unlearn_head/head_forget_nll_gap": forget_nll_zF - forget_nll_z0,
-            "unlearn_head/head_retain_nll_gap": retain_nll_zR - retain_nll_z0,
-            # End-to-end metrics: router and heads together, as a user sees it
+            "unlearn_head/classifier_score_mean_forget": _safe_mean(forget_scores),
+            "unlearn_head/classifier_score_mean_retain": _safe_mean(retain_scores),
+            "unlearn_head/classifier_tpr_at_tau": _fraction_above(
+                forget_scores, self.tau
+            ),
+            "unlearn_head/classifier_fpr_at_tau": _fraction_above(
+                retain_scores, self.tau
+            ),
+            "unlearn_head/adapter_forget_nll_gap": forget_nll_zf - forget_nll_z0,
+            "unlearn_head/adapter_retain_nll_gap": retain_nll_zr - retain_nll_z0,
             "unlearn_head/e2e_forget_nll_gated": _safe_mean(
-                [m["nll_gated"] for m in forget_metrics]
+                [metric["nll_gated"] for metric in forget_metrics]
             ),
             "unlearn_head/e2e_retain_nll_gated": _safe_mean(
-                [m["nll_gated"] for m in retain_metrics]
+                [metric["nll_gated"] for metric in retain_metrics]
             ),
         }
         self.log(metrics)
         return metrics
 
-    def _save_heads(self):
-        path = os.path.join(self.args.output_dir, "unlearn_head.pt")
-        torch.save(
-            {
-                "forget_head": self.forget_head.state_dict(),
-                "retain_head": self.retain_head.state_dict(),
-                "tau": self.tau,
-                "rank": self.rank,
-                "lam": self.lam,
-                "epsilon": self.epsilon,
-                "prompt_loss_weight": self.prompt_loss_weight,
-                "backbone": self.model.config._name_or_path,
-                "model_type": self.model.config.model_type,
-                "format_version": 1,
-            },
-            path,
-        )
-
     def train(self, *args, **kwargs):
+        self._adapters_trained = False
         output = super().train(*args, **kwargs)
+        self._adapters_trained = True
         if self.accelerator.is_local_main_process:
             if self.calibrate and self.retain_cal is not None:
                 self._calibrate()
             if self.retain_cal is not None and self.forget_cal is not None:
                 self._log_diagnostics()
-            self._save_heads()
         return output
 
+    @staticmethod
+    def _is_prefill(kwargs):
+        cache_position = kwargs.get("cache_position")
+        if cache_position is None:
+            return kwargs.get("past_key_values") is None
+        return cache_position.numel() == 0 or cache_position[0].item() == 0
+
     def _install_correction_hook(self):
-        """Shared hook for generate_with_correction/evaluate. Computes alpha(q)
-        once at prefill (cache_position==0) from that call's own logits/hidden
-        state, caches it for later cached steps. Uses real labels when present
-        (teacher-forced metrics), else treats the whole input as the prompt
-        (generation). Assumes greedy/sampling decoding, not beam search.
-        Returns (handle, cache); cache fills in "scores"/"alpha" after prefill."""
-        forget_head, retain_head = self.forget_head, self.retain_head
-        cache = {"alpha": None, "scores": None}
+        """Install all-linear adapter contrast during forward/generation.
 
-        def hook(module, args, kwargs, output):
-            cache_position = kwargs.get("cache_position")
-            is_prefill = cache_position is None or cache_position[0].item() == 0
+        Adapter-specific KV caches are kept separately during generation, so
+        the forget and retain logits reflect complete adapted transformer
+        passes rather than only an adapted output projection.
+        """
+        cache = {
+            "alpha": None,
+            "scores": None,
+            "forget_past": None,
+            "retain_past": None,
+        }
+        previous_active_adapters = list(self.model.active_adapters)
+        self.model.disable_adapter_layers()
+        # PeftModel.generate delegates to the wrapped Transformers model, so
+        # install correction hooks on that model rather than on PeftModel.
+        correction_model = self.model.get_base_model()
 
-            h = output.hidden_states[-1]
-            delta_f, delta_r = forget_head(h), retain_head(h)
+        def correction_hook(module, args, kwargs, output):
+            if self._inside_correction_branch:
+                return output
+            if not hasattr(output, "logits"):
+                raise RuntimeError(
+                    "UnlearnHead requires return_dict=True outputs with logits."
+                )
 
-            if is_prefill:
+            is_prefill = self._is_prefill(kwargs)
+
+            # Oracle routing is known before either adapter is evaluated. If
+            # the whole batch is inactive, return the base output immediately.
+            if is_prefill and self.classifier == "oracle":
+                cache["scores"] = self._oracle_scores(
+                    output.logits.shape[0], output.logits.device
+                )
+                cache["alpha"] = self._classifier_alpha(cache["scores"])
+                if not torch.any(cache["alpha"] != 0).item():
+                    return output
+            elif not is_prefill:
+                if (
+                    cache["alpha"] is None
+                    or cache["alpha"].shape[0] != output.logits.shape[0]
+                ):
+                    raise RuntimeError(
+                        "Batch size changed between decoding steps. Beam search is "
+                        "not supported; use greedy or sampling decoding."
+                    )
+                # Once routing rejects a prompt, its gate remains closed for
+                # the complete generation, so no adapter KV cache is needed.
+                if not torch.any(cache["alpha"] != 0).item():
+                    return output
+
+            branch_outputs = {}
+            self._inside_correction_branch = True
+            self.model.enable_adapter_layers()
+            try:
+                for adapter_name in ("forget", "retain"):
+                    branch_kwargs = dict(kwargs)
+                    branch_kwargs.pop("labels", None)
+                    branch_kwargs["return_dict"] = True
+                    if is_prefill:
+                        branch_kwargs["past_key_values"] = None
+                    else:
+                        branch_past = cache[f"{adapter_name}_past"]
+                        if branch_past is None:
+                            raise RuntimeError(
+                                "Missing adapter KV cache during decoding. Start a "
+                                "new generate() call with a full prompt."
+                            )
+                        branch_kwargs["past_key_values"] = branch_past
+
+                    with self._using_adapter(adapter_name):
+                        branch_output = module(*args, **branch_kwargs)
+                    branch_outputs[adapter_name] = branch_output
+                    cache[f"{adapter_name}_past"] = getattr(
+                        branch_output, "past_key_values", None
+                    )
+            finally:
+                self.model.disable_adapter_layers()
+                self._inside_correction_branch = False
+
+            zf = branch_outputs["forget"].logits
+            zr = branch_outputs["retain"].logits
+
+            if is_prefill and self.classifier != "oracle":
                 input_ids = kwargs.get("input_ids")
+                if input_ids is None and args:
+                    input_ids = args[0]
                 if input_ids is None:
                     raise RuntimeError(
-                        "UnlearnHead correction hook needs input_ids at the "
-                        "prefill step to compute the router score; none were "
-                        "found in this forward call."
+                        "The correction hook needs input_ids at the prefill step."
                     )
                 attention_mask = kwargs.get("attention_mask")
                 if attention_mask is None:
@@ -427,62 +535,85 @@ class UnlearnHead(UnlearnTrainer):
                 labels = kwargs.get("labels")
                 if labels is None:
                     labels = torch.full_like(input_ids, -100)
-
-                next_tokens = input_ids[..., 1:]
-                tok_f = self._token_logp(output.logits + delta_f, next_tokens)
-                tok_r = self._token_logp(output.logits + delta_r, next_tokens)
-                prompt_mask = (labels[..., 1:] == -100) & (attention_mask[..., 1:] == 1)
-                scores = self._masked_ratio(tok_f, tok_r, prompt_mask)
+                scores = self._classifier_scores(
+                    input_ids, attention_mask, labels, zf, zr
+                )
                 cache["scores"] = scores
-                cache["alpha"] = torch.where(
-                    scores > self.tau,
-                    torch.full_like(scores, self.lam),
-                    torch.zeros_like(scores),
-                )
-            elif cache["alpha"].shape[0] != output.logits.shape[0]:
-                raise RuntimeError(
-                    "Batch size changed between decoding steps (likely beam "
-                    "search). UnlearnHead's correction hook only supports "
-                    "greedy/sampling decoding."
-                )
+                cache["alpha"] = self._classifier_alpha(scores)
 
-            alpha = cache["alpha"].view(-1, *([1] * (delta_f.dim() - 1)))
-            output.logits = output.logits - alpha.to(delta_f.device) * (delta_f - delta_r)
+                # The adapter prefill was needed to classify the prompt, but
+                # no correction or adapter decoding is needed when it rejects.
+                if not torch.any(cache["alpha"] != 0).item():
+                    return output
+
+            alpha = cache["alpha"].view(-1, *([1] * (zf.dim() - 1)))
+            output.logits = output.logits - alpha.to(zf.device) * (zf - zr)
+            labels = kwargs.get("labels")
+            if labels is not None:
+                # Correction hooks are installed only for post-training
+                # evaluation. Keep loss consistent with the corrected logits
+                # for callers that consume the model-provided loss.
+                output.loss = self._ce_loss(output.logits, labels)
             return output
 
-        handle = self.model.register_forward_hook(hook, with_kwargs=True)
-        return handle, cache
+        hook_targets = [self.model, correction_model]
+        handles = []
+        for hook_target in hook_targets:
+            handles.append(
+                hook_target.register_forward_hook(
+                    correction_hook, with_kwargs=True
+                )
+            )
 
-    def generate_with_correction(self, prompts, max_new_tokens=64, **generate_kwargs):
-        """Corrected decoding for one prompt or a list of prompts, each with
-        its own independently gated alpha(q) (Eq. 13, single-request case)."""
+        def restore_adapter_state():
+            self.model.enable_adapter_layers()
+            if len(previous_active_adapters) == 1:
+                self.model.set_adapter(previous_active_adapters[0])
+            else:
+                self.model.base_model.set_adapter(previous_active_adapters)
+
+        return _HookGroup(
+            handles, cleanup=restore_adapter_state
+        ), cache
+
+    def generate_with_correction(
+        self, prompts, max_new_tokens=64, is_forget=None, **generate_kwargs
+    ):
+        """Generate with adapter correction for one prompt or a prompt list.
+
+        ``is_forget`` is required only for the oracle classifier. It can be a
+        bool for a single prompt or one bool per prompt.
+        """
+        if not self._adapters_trained:
+            raise RuntimeError("Call train() before generating with correction.")
         if self.tau is None:
-            raise RuntimeError("Router isn't calibrated yet — call train() first.")
+            raise RuntimeError("Classifier isn't calibrated yet; call train() first.")
+        if self.classifier == "oracle" and is_forget is None:
+            raise RuntimeError(
+                "Oracle generation requires is_forget=True/False for each prompt."
+            )
 
         single = isinstance(prompts, str)
         prompt_list = [prompts] if single else list(prompts)
-
         tokenizer = self.processing_class
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
         original_padding_side = tokenizer.padding_side
-        tokenizer.padding_side = "left"  # required for batched causal-LM generation
+        tokenizer.padding_side = "left"
         try:
-            enc = tokenizer(prompt_list, return_tensors="pt", padding=True)
+            encoding = tokenizer(prompt_list, return_tensors="pt", padding=True)
         finally:
             tokenizer.padding_side = original_padding_side
 
         device = next(self.model.parameters()).device
-        enc = enc.to(device)
-
+        encoding = encoding.to(device)
         self.model.eval()
         handle, cache = self._install_correction_hook()
         try:
-            with torch.no_grad():
+            with self.classifier_context(is_forget), torch.no_grad():
                 output_ids = self.model.generate(
-                    **enc,
+                    **encoding,
                     max_new_tokens=max_new_tokens,
-                    output_hidden_states=True,
                     **generate_kwargs,
                 )
         finally:
@@ -490,23 +621,29 @@ class UnlearnHead(UnlearnTrainer):
 
         texts = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
         results = [
-            {"text": t, "score": s.item(), "alpha": a.item(), "tau": self.tau}
-            for t, s, a in zip(texts, cache["scores"], cache["alpha"])
+            {
+                "text": text,
+                "score": score.item(),
+                "alpha": alpha.item(),
+                "tau": self.tau,
+                "classifier": self.classifier,
+            }
+            for text, score, alpha in zip(texts, cache["scores"], cache["alpha"])
         ]
         return results[0] if single else results
 
     def evaluate(
         self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval", trial=None
     ):
-        """Wraps FinetuneTrainer.evaluate so every metric sees corrected z_U."""
-        if self.tau is None:
-            return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, trial)
+        """Wrap evaluation so every metric receives corrected logits."""
+        if not self._adapters_trained or self.tau is None:
+            with self.model.disable_adapter():
+                return super().evaluate(
+                    eval_dataset, ignore_keys, metric_key_prefix, trial
+                )
 
-        original_output_hidden_states = self.model.config.output_hidden_states
-        self.model.config.output_hidden_states = True
         handle, _ = self._install_correction_hook()
         try:
             return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, trial)
         finally:
             handle.remove()
-            self.model.config.output_hidden_states = original_output_hidden_states

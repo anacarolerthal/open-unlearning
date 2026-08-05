@@ -1,0 +1,9 @@
+defaults:
+  - finetune
+
+handler: LoraDiff
+method_args:
+  rank: 16
+  lora_alpha: 16
+  lora_dropout: 0.0
+  strength: 1.0

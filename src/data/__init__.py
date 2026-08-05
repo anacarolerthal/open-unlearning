@@ -1,3 +1,4 @@
+import re
 from typing import Dict, Any, Union
 from omegaconf import DictConfig
 
@@ -31,7 +32,26 @@ def _load_single_dataset(dataset_name, dataset_cfg: DictConfig, **kwargs):
             f"{dataset_handler_name} not implemented or not registered"
         )
     dataset_args = dataset_cfg.args
-    return dataset_handler(**dataset_args, **kwargs)
+    dataset = dataset_handler(**dataset_args, **kwargs)
+
+    # Evaluation-time classifiers may need the ground-truth source of a
+    # dataset. Allow an explicit override, while making the conventional
+    # *_forget dataset names work without changes to every metric config.
+    unlearn_origin = dataset_cfg.get("unlearn_origin", None)
+    if unlearn_origin is None:
+        unlearn_origin = bool(
+            re.search(r"(^|[_-])forget($|[_-])", dataset_name.lower())
+        )
+    elif isinstance(unlearn_origin, str):
+        normalized_origin = unlearn_origin.lower()
+        if normalized_origin not in {"forget", "retain"}:
+            raise ValueError(
+                "unlearn_origin must be a bool, 'forget', or 'retain'; "
+                f"got {unlearn_origin!r} for {dataset_name}"
+            )
+        unlearn_origin = normalized_origin == "forget"
+    dataset.unlearn_origin = bool(unlearn_origin)
+    return dataset
 
 
 def get_datasets(dataset_cfgs: Union[Dict, DictConfig], **kwargs):
