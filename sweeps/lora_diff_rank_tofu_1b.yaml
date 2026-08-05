@@ -1,5 +1,5 @@
 # Optional registration command (not run automatically):
-# wandb sweep sweeps/lora_diff_tofu_1b.yaml
+# wandb sweep sweeps/lora_diff_rank_tofu_1b.yaml
 # Launch after registration: wandb agent <entity/project/sweep_id>
 
 program: src/train.py
@@ -9,20 +9,18 @@ metric:
   name: eval/forget_quality
   goal: maximize
 
-# Third iteration: 4 one-sided suppression strengths = 4 runs.
-# Rank 16 and learning rate 1e-4 are fixed because the latest sweep showed
-# little rank sensitivity and rank 16 was at least as good as rank 8. Values
-# 2--4 cover the useful region from the latest sweep; 6 covers the effective
-# range of its probability metrics now that correction is applied only once.
+# Third iteration companion: 4 selective rank corrections = 4 runs.
+# Adapter training matches the best-supported settings from the latest sweep;
+# only the inference-time token cutoff changes.
 parameters:
   trainer.args.learning_rate:
     value: 1.0e-4
   trainer.method_args.rank:
     value: 16
   trainer.method_args.correction_mode:
-    value: suppression
-  trainer.method_args.strength:
-    values: [2.0, 3.0, 4.0, 6.0]
+    value: rank
+  trainer.method_args.rank_k:
+    values: [5, 10, 20, 50]
 
 command:
   - uv
@@ -44,5 +42,5 @@ command:
   - trainer.args.report_to=wandb
   - trainer.args.eval_strategy=no
   - trainer.args.eval_on_start=False
-  - task_name=sweep_lora_diff_v3_suppression_strength${trainer.method_args.strength}_${oc.env:WANDB_RUN_ID}
+  - task_name=sweep_lora_diff_v3_rank_k${trainer.method_args.rank_k}_${oc.env:WANDB_RUN_ID}
   - ${args_no_hyphens}

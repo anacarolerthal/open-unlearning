@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 
+import torch
 import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
 
@@ -10,9 +11,11 @@ class LoraDiff(UnlearnTrainer):
     """Oracle-gated difference between forget and retain LoRA adapters.
 
     Both adapters are trained with ordinary language-modeling loss. After
-    training, forget evaluation uses
+    training, forget evaluation uses one of three corrections:
 
-        base_logits - strength * (forget_logits - retain_logits)
+        linear:      base - strength * (forget - retain)
+        suppression: base - strength * relu(forget - retain)
+        rank:         replace the top-k positively divergent token logits
 
     while retain and holdout evaluation use the unchanged base model.
     """
@@ -23,6 +26,8 @@ class LoraDiff(UnlearnTrainer):
         lora_alpha=16,
         lora_dropout=0.0,
         strength=1.0,
+        correction_mode="linear",
+        rank_k=20,
         model=None,
         *args,
         **kwargs,
@@ -46,6 +51,14 @@ class LoraDiff(UnlearnTrainer):
             self.label_names = ["labels"]
         self.model_accepts_loss_kwargs = False
         self.strength = strength
+        self.correction_mode = correction_mode.lower()
+        self.rank_k = rank_k
+        if self.correction_mode not in {"linear", "suppression", "rank"}:
+            raise ValueError(
+                "correction_mode must be 'linear', 'suppression', or 'rank'"
+            )
+        if self.rank_k < 1:
+            raise ValueError("rank_k must be positive")
         self._trained = False
         self._is_forget = False
         self._computing_adapter_logits = False
@@ -103,6 +116,25 @@ class LoraDiff(UnlearnTrainer):
             ignore_index=-100,
         )
 
+    def _apply_correction(self, base_logits, forget_logits, retain_logits):
+        divergence = forget_logits - retain_logits
+
+        if self.correction_mode == "linear":
+            return base_logits - self.strength * divergence
+
+        if self.correction_mode == "suppression":
+            return base_logits - self.strength * F.relu(divergence)
+
+        k = min(self.rank_k, base_logits.shape[-1])
+        top_divergence, token_ids = divergence.topk(k, dim=-1)
+        selected_logits = base_logits.gather(-1, token_ids)
+        kth_logit = base_logits.topk(k, dim=-1).values[..., -1:]
+        replacements = kth_logit.expand_as(selected_logits)
+        replacements = torch.where(
+            top_divergence > 0, replacements, selected_logits
+        )
+        return base_logits.scatter(-1, token_ids, replacements)
+
     @contextmanager
     def _correct_forget_logits(self):
         """Install the small inference-only correction used by evaluators."""
@@ -134,18 +166,16 @@ class LoraDiff(UnlearnTrainer):
                 self.model.disable_adapter_layers()
                 self._computing_adapter_logits = False
 
-            output.logits = output.logits - self.strength * (
-                forget_logits - retain_logits
+            output.logits = self._apply_correction(
+                output.logits, forget_logits, retain_logits
             )
             if labels is not None:
                 output.loss = self._causal_lm_loss(output.logits, labels)
             return output
 
-        # PEFT uses one path for forward() and another for generate().
-        handles = [
-            self.model.register_forward_hook(correction_hook, with_kwargs=True),
-            base_model.register_forward_hook(correction_hook, with_kwargs=True),
-        ]
+        handle = base_model.register_forward_hook(
+            correction_hook, with_kwargs=True
+        )
 
         # Recomputing the complete prefix keeps all-linear LoRA generation
         # correct without maintaining three separate KV caches.
@@ -154,8 +184,7 @@ class LoraDiff(UnlearnTrainer):
             with self.model.disable_adapter():
                 yield
         finally:
-            for handle in handles:
-                handle.remove()
+            handle.remove()
             self.model.generate = original_generate
             self.model.base_model.set_adapter(previous_adapters)
 
