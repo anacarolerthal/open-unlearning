@@ -8,13 +8,13 @@ from trainer.unlearn.base import UnlearnTrainer
 
 
 class LoraDiff(UnlearnTrainer):
-    """Oracle-gated difference between forget and retain LoRA adapters.
+    """Oracle-gated difference between a forget LoRA and a reference.
 
-    Both adapters are trained with ordinary language-modeling loss. After
-    training, forget evaluation uses one of three corrections:
+    The reference can be either a retain LoRA or the unchanged base model.
+    After training, forget evaluation uses one of three corrections:
 
-        linear:      base - strength * (forget - retain)
-        suppression: base - strength * relu(forget - retain)
+        linear:      base - strength * (forget - reference)
+        suppression: base - strength * relu(forget - reference)
         rank:         replace the top-k positively divergent token logits
 
     while retain and holdout evaluation use the unchanged base model.
@@ -27,6 +27,7 @@ class LoraDiff(UnlearnTrainer):
         lora_dropout=0.0,
         strength=1.0,
         correction_mode="linear",
+        difference_reference="retain",
         rank_k=20,
         model=None,
         *args,
@@ -42,9 +43,14 @@ class LoraDiff(UnlearnTrainer):
                 target_modules="all-linear",
             )
 
+        difference_reference = difference_reference.lower()
+        if difference_reference not in {"retain", "base"}:
+            raise ValueError("difference_reference must be 'retain' or 'base'")
+
         model = get_peft_model(model, make_lora_config(), adapter_name="forget")
-        model.add_adapter("retain", make_lora_config())
-        model.base_model.set_adapter(["forget", "retain"])
+        if difference_reference == "retain":
+            model.add_adapter("retain", make_lora_config())
+            model.base_model.set_adapter(["forget", "retain"])
 
         super().__init__(*args, model=model, **kwargs)
         if not self.label_names:
@@ -52,6 +58,7 @@ class LoraDiff(UnlearnTrainer):
         self.model_accepts_loss_kwargs = False
         self.strength = strength
         self.correction_mode = correction_mode.lower()
+        self.difference_reference = difference_reference
         self.rank_k = rank_k
         if self.correction_mode not in {"linear", "suppression", "rank"}:
             raise ValueError(
@@ -98,8 +105,10 @@ class LoraDiff(UnlearnTrainer):
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
         forget_outputs = self._adapter_forward(model, inputs["forget"], "forget")
-        retain_outputs = self._adapter_forward(model, inputs["retain"], "retain")
-        loss = forget_outputs.loss + retain_outputs.loss
+        loss = forget_outputs.loss
+        if self.difference_reference == "retain":
+            retain_outputs = self._adapter_forward(model, inputs["retain"], "retain")
+            loss = loss + retain_outputs.loss
         return (loss, forget_outputs) if return_outputs else loss
 
     def train(self, *args, **kwargs):
@@ -116,8 +125,8 @@ class LoraDiff(UnlearnTrainer):
             ignore_index=-100,
         )
 
-    def _apply_correction(self, base_logits, forget_logits, retain_logits):
-        divergence = forget_logits - retain_logits
+    def _apply_correction(self, base_logits, forget_logits, reference_logits):
+        divergence = forget_logits - reference_logits
 
         if self.correction_mode == "linear":
             return base_logits - self.strength * divergence
@@ -164,14 +173,17 @@ class LoraDiff(UnlearnTrainer):
             try:
                 with self._use_adapter("forget"):
                     forget_logits = module(*args, **branch_kwargs).logits
-                with self._use_adapter("retain"):
-                    retain_logits = module(*args, **branch_kwargs).logits
+                if self.difference_reference == "retain":
+                    with self._use_adapter("retain"):
+                        reference_logits = module(*args, **branch_kwargs).logits
+                else:
+                    reference_logits = output.logits
             finally:
                 self.model.disable_adapter_layers()
                 self._computing_adapter_logits = False
 
             output.logits = self._apply_correction(
-                output.logits, forget_logits, retain_logits
+                output.logits, forget_logits, reference_logits
             )
             if labels is not None:
                 output.loss = self._causal_lm_loss(output.logits, labels)
