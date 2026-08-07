@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-uv run wandb agent juanbelieni-lab/open-unlearning/70228tai
-uv run wandb agent juanbelieni-lab/open-unlearning/2q4fea6b
-uv run wandb agent juanbelieni-lab/open-unlearning/yv1x0ava
+uv run wandb agent juanbelieni-lab/open-unlearning/ogdxqrm1
+uv run wandb agent juanbelieni-lab/open-unlearning/6fjxc92a
+uv run wandb agent juanbelieni-lab/open-unlearning/l8dxx42p

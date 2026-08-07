@@ -59,6 +59,8 @@ class Evaluator:
             agg_value = metric_results.get("agg_value", None)
             if agg_value is not None:
                 metric_summary[metric_name] = agg_value
+            for name, value in metric_results.get("summary", {}).items():
+                metric_summary[f"{metric_name}_{name}"] = value
         return metric_summary
 
     def evaluate(self, model, output_dir=None, overwrite=None, **kwargs):

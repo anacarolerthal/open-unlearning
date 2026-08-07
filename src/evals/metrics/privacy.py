@@ -29,7 +29,8 @@ def ks_test(model, **kwargs):
             "retain_model_logs not provided in reference_logs, setting forget_quality to None"
         )
         pvalue = None
-    return {"agg_value": pvalue}
+    summary = {"ks_statistic": float(fq.statistic)} if pvalue is not None else {}
+    return {"agg_value": pvalue, "summary": summary}
 
 
 @unlearning_metric(name="privleak")

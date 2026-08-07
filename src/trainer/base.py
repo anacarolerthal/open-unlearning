@@ -29,6 +29,7 @@ class FinetuneTrainer(Trainer):
         ignore_keys: Optional[List[str]] = None,
         metric_key_prefix: str = "eval",
         trial: Dict[str, Any] = None,
+        output_subdir: Optional[str] = None,
     ) -> Dict[str, float]:
         # Run a custom evaluator and save results
         if self.evaluators and self.accelerator.is_local_main_process:
@@ -41,6 +42,8 @@ class FinetuneTrainer(Trainer):
             run_dir = self._get_output_dir(trial=trial)
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
             output_dir = os.path.join(run_dir, checkpoint_folder, "evals")
+            if output_subdir:
+                output_dir = os.path.join(output_dir, output_subdir)
             os.makedirs(output_dir, exist_ok=True)
             eval_metrics = {}
             for _, evaluator in self.evaluators.items():

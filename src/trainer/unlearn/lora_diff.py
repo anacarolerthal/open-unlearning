@@ -5,6 +5,10 @@ import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
 
 from trainer.unlearn.base import UnlearnTrainer
+from trainer.unlearn.lora_diff_diagnostics import (
+    DiagnosticEpochCallback,
+    LoraDiffDiagnostics,
+)
 
 
 class LoraDiff(UnlearnTrainer):
@@ -29,6 +33,10 @@ class LoraDiff(UnlearnTrainer):
         correction_mode="linear",
         difference_reference="retain",
         rank_k=20,
+        diagnostic_strengths=None,
+        diagnostic_epochs=None,
+        diagnostic_retain_model_path=None,
+        diagnostic_retain_strength=4.0,
         model=None,
         *args,
         **kwargs,
@@ -60,6 +68,16 @@ class LoraDiff(UnlearnTrainer):
         self.correction_mode = correction_mode.lower()
         self.difference_reference = difference_reference
         self.rank_k = rank_k
+        self.diagnostic_strengths = (
+            [float(value) for value in diagnostic_strengths]
+            if diagnostic_strengths
+            else []
+        )
+        self.diagnostic_epochs = (
+            [int(value) for value in diagnostic_epochs] if diagnostic_epochs else []
+        )
+        self.diagnostic_retain_model_path = diagnostic_retain_model_path
+        self.diagnostic_retain_strength = float(diagnostic_retain_strength)
         if self.correction_mode not in {"linear", "suppression", "rank"}:
             raise ValueError(
                 "correction_mode must be 'linear', 'suppression', or 'rank'"
@@ -67,11 +85,20 @@ class LoraDiff(UnlearnTrainer):
         if self.rank_k < 1:
             raise ValueError("rank_k must be positive")
         self._trained = False
+        self._training = False
         self._is_forget = False
         self._computing_adapter_logits = False
+        self.diagnostics = LoraDiffDiagnostics(
+            self,
+            retain_model_path=diagnostic_retain_model_path,
+            retain_strength=self.diagnostic_retain_strength,
+        )
 
         # Evaluation datasets set this context before calling the model.
         self.model.unlearn_classifier_context = self.classifier_context
+        self.model.lora_diff_diagnostic_batch = self.diagnostics.batch
+        if self.diagnostic_epochs:
+            self.add_callback(DiagnosticEpochCallback(self.diagnostic_epochs))
 
     @contextmanager
     def classifier_context(self, is_forget):
@@ -113,7 +140,11 @@ class LoraDiff(UnlearnTrainer):
 
     def train(self, *args, **kwargs):
         self._trained = False
-        output = super().train(*args, **kwargs)
+        self._training = True
+        try:
+            output = super().train(*args, **kwargs)
+        finally:
+            self._training = False
         self._trained = True
         return output
 
@@ -213,13 +244,46 @@ class LoraDiff(UnlearnTrainer):
     def evaluate(
         self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval", trial=None
     ):
-        if not self._trained:
+        correction_ready = self._trained or (
+            self._training and self.state.global_step > 0
+        )
+        if not correction_ready:
             with self.model.disable_adapter():
                 return super().evaluate(
                     eval_dataset, ignore_keys, metric_key_prefix, trial
                 )
 
+        if self.diagnostic_strengths:
+            self.diagnostics.clear_batch_cache()
+            epoch_prefix = ""
+            if self._training:
+                epoch_prefix = f"epoch_{round(self.state.epoch)}_"
+
+            original_strength = self.strength
+            metrics = {}
+            try:
+                for strength in self.diagnostic_strengths:
+                    self.strength = strength
+                    strength_slug = f"{strength:g}".replace(".", "p")
+                    label = f"{epoch_prefix}strength_{strength_slug}"
+                    with self._correct_forget_logits():
+                        strength_metrics = super().evaluate(
+                            eval_dataset,
+                            ignore_keys,
+                            f"{metric_key_prefix}_{label}",
+                            trial,
+                            output_subdir=label,
+                        )
+                    metrics.update(strength_metrics)
+                    self.diagnostics.log_evaluation_artifact(label, trial)
+            finally:
+                self.strength = original_strength
+            self.diagnostics.run_retain_direction()
+            return metrics
+
         with self._correct_forget_logits():
-            return super().evaluate(
+            metrics = super().evaluate(
                 eval_dataset, ignore_keys, metric_key_prefix, trial
             )
+        self.diagnostics.run_retain_direction()
+        return metrics

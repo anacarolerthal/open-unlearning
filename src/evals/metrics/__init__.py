@@ -22,6 +22,7 @@ from evals.metrics.utility import (
     hm_aggregate,
     classifier_prob,
 )
+from evals.metrics.diagnostics import lora_diff_diagnostics
 
 METRICS_REGISTRY: Dict[str, UnlearningMetric] = {}
 
@@ -62,6 +63,7 @@ _register_metric(privleak)
 _register_metric(rel_diff)
 _register_metric(exact_memorization)
 _register_metric(extraction_strength)
+_register_metric(lora_diff_diagnostics)
 
 # Register MIA metrics
 _register_metric(mia_loss)

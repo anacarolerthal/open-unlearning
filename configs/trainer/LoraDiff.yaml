@@ -10,3 +10,7 @@ method_args:
   correction_mode: linear
   difference_reference: retain
   rank_k: 20
+  diagnostic_strengths: null
+  diagnostic_epochs: null
+  diagnostic_retain_model_path: null
+  diagnostic_retain_strength: 4.0
