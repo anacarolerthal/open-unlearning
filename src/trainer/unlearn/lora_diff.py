@@ -2,7 +2,8 @@ from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, RoadConfig, TaskType, get_peft_model
+from peft.tuners.road.layer import _apply_road
 
 from trainer.unlearn.base import UnlearnTrainer
 from trainer.unlearn.lora_diff_diagnostics import (
@@ -12,9 +13,9 @@ from trainer.unlearn.lora_diff_diagnostics import (
 
 
 class LoraDiff(UnlearnTrainer):
-    """Oracle-gated difference between a forget LoRA and a reference.
+    """Oracle-gated difference between a forget adapter and a reference.
 
-    The reference can be either a retain LoRA or the unchanged base model.
+    The reference can be either a retain adapter or the unchanged base model.
     After training, forget evaluation uses one of three corrections:
 
         linear:      base - strength * (forget - reference)
@@ -26,6 +27,7 @@ class LoraDiff(UnlearnTrainer):
 
     def __init__(
         self,
+        adapter_type="all_linear_lora",
         rank=16,
         lora_alpha=16,
         lora_dropout=0.0,
@@ -41,29 +43,50 @@ class LoraDiff(UnlearnTrainer):
         *args,
         **kwargs,
     ):
-        def make_lora_config():
+        adapter_type = adapter_type.lower()
+        if adapter_type not in {"all_linear_lora", "lm_head_lora", "road"}:
+            raise ValueError(
+                "adapter_type must be 'all_linear_lora', 'lm_head_lora', or 'road'"
+            )
+
+        def make_adapter_config():
+            if adapter_type == "road":
+                if rank not in {1, 2, 4}:
+                    raise ValueError("RoAd rank must be 1, 2, or 4")
+                return RoadConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    variant=f"road_{rank}",
+                    group_size=64,
+                    target_modules=["lm_head"],
+                )
+
+            target_modules = (
+                ["lm_head"] if adapter_type == "lm_head_lora" else "all-linear"
+            )
             return LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 r=rank,
                 lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout,
                 bias="none",
-                target_modules="all-linear",
+                target_modules=target_modules,
             )
 
         difference_reference = difference_reference.lower()
         if difference_reference not in {"retain", "base"}:
             raise ValueError("difference_reference must be 'retain' or 'base'")
 
-        model = get_peft_model(model, make_lora_config(), adapter_name="forget")
+        model = get_peft_model(model, make_adapter_config(), adapter_name="forget")
         if difference_reference == "retain":
-            model.add_adapter("retain", make_lora_config())
+            model.add_adapter("retain", make_adapter_config())
             model.base_model.set_adapter(["forget", "retain"])
 
         super().__init__(*args, model=model, **kwargs)
         if not self.label_names:
             self.label_names = ["labels"]
         self.model_accepts_loss_kwargs = False
+        self.adapter_type = adapter_type
+        self.output_only_adapter = adapter_type in {"lm_head_lora", "road"}
         self.strength = strength
         self.correction_mode = correction_mode.lower()
         self.difference_reference = difference_reference
@@ -128,6 +151,30 @@ class LoraDiff(UnlearnTrainer):
                 return_dict=True,
             )
 
+    def _output_adapter_logits(
+        self, output_layer, base_logits, hidden, adapter_name
+    ):
+        if self.adapter_type == "road":
+            theta = output_layer.road_theta[adapter_name]
+            road_logits = _apply_road(
+                output_layer.variant[adapter_name],
+                output_layer.group_size[adapter_name],
+                theta,
+                output_layer.road_alpha[adapter_name],
+                base_logits.to(theta.dtype),
+            )
+            return road_logits.to(base_logits.dtype)
+
+        if hidden is None:
+            raise RuntimeError("LM-head input was not captured")
+        adapter_input = hidden.to(output_layer.lora_A[adapter_name].weight.dtype)
+        adapter_input = output_layer.lora_dropout[adapter_name](adapter_input)
+        delta = output_layer.lora_B[adapter_name](
+            output_layer.lora_A[adapter_name](adapter_input)
+        )
+        delta = delta * output_layer.scaling[adapter_name]
+        return base_logits + delta.to(base_logits.dtype)
+
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
@@ -179,39 +226,62 @@ class LoraDiff(UnlearnTrainer):
     def _correct_forget_logits(self):
         """Install the small inference-only correction used by evaluators."""
         base_model = self.model.get_base_model()
+        output_layer = base_model.get_output_embeddings()
         previous_adapters = list(self.model.active_adapters)
         original_generate = self.model.generate
+        output_hidden = None
 
         def generate_without_cache(*args, **kwargs):
             kwargs["use_cache"] = False
             return original_generate(*args, **kwargs)
 
+        def capture_output_hidden(module, args, kwargs):
+            nonlocal output_hidden
+            if not self._computing_adapter_logits:
+                output_hidden = args[0]
+
         def correction_hook(module, args, kwargs, output):
+            nonlocal output_hidden
             if (
                 self._computing_adapter_logits
                 or not self._is_forget
                 or getattr(output, "_lora_diff_corrected", False)
             ):
+                if not self._computing_adapter_logits:
+                    output_hidden = None
                 return output
 
-            branch_kwargs = dict(kwargs)
-            labels = branch_kwargs.pop("labels", None)
-            branch_kwargs["use_cache"] = False
-            branch_kwargs["return_dict"] = True
+            labels = kwargs.get("labels")
 
-            self._computing_adapter_logits = True
-            self.model.enable_adapter_layers()
-            try:
-                with self._use_adapter("forget"):
-                    forget_logits = module(*args, **branch_kwargs).logits
+            if self.output_only_adapter:
+                forget_logits = self._output_adapter_logits(
+                    output_layer, output.logits, output_hidden, "forget"
+                )
                 if self.difference_reference == "retain":
-                    with self._use_adapter("retain"):
-                        reference_logits = module(*args, **branch_kwargs).logits
+                    reference_logits = self._output_adapter_logits(
+                        output_layer, output.logits, output_hidden, "retain"
+                    )
                 else:
                     reference_logits = output.logits
-            finally:
-                self.model.disable_adapter_layers()
-                self._computing_adapter_logits = False
+                output_hidden = None
+            else:
+                self._computing_adapter_logits = True
+                self.model.enable_adapter_layers()
+                try:
+                    branch_kwargs = dict(kwargs)
+                    branch_kwargs.pop("labels", None)
+                    branch_kwargs["use_cache"] = False
+                    branch_kwargs["return_dict"] = True
+                    with self._use_adapter("forget"):
+                        forget_logits = module(*args, **branch_kwargs).logits
+                    if self.difference_reference == "retain":
+                        with self._use_adapter("retain"):
+                            reference_logits = module(*args, **branch_kwargs).logits
+                    else:
+                        reference_logits = output.logits
+                finally:
+                    self.model.disable_adapter_layers()
+                    self._computing_adapter_logits = False
 
             output.logits = self._apply_correction(
                 output.logits, forget_logits, reference_logits
@@ -228,10 +298,17 @@ class LoraDiff(UnlearnTrainer):
             self.model.register_forward_hook(correction_hook, with_kwargs=True),
             base_model.register_forward_hook(correction_hook, with_kwargs=True),
         ]
+        if self.adapter_type == "lm_head_lora":
+            handles.append(
+                output_layer.register_forward_pre_hook(
+                    capture_output_hidden, with_kwargs=True
+                )
+            )
 
-        # Recomputing the complete prefix keeps all-linear LoRA generation
-        # correct without maintaining three separate KV caches.
-        self.model.generate = generate_without_cache
+        if not self.output_only_adapter:
+            # Recomputing the complete prefix keeps all-linear LoRA generation
+            # correct without maintaining three separate KV caches.
+            self.model.generate = generate_without_cache
         try:
             with self.model.disable_adapter():
                 yield

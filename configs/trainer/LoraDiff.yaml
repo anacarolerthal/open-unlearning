@@ -3,6 +3,7 @@ defaults:
 
 handler: LoraDiff
 method_args:
+  adapter_type: all_linear_lora
   rank: 16
   lora_alpha: 16
   lora_dropout: 0.0
