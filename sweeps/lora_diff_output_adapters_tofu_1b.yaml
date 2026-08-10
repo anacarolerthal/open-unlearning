@@ -2,26 +2,26 @@ program: src/train.py
 project: open-unlearning
 method: grid
 metric:
-  name: eval/strength_4_forget_quality
+  name: eval/strength_80_forget_quality
   goal: maximize
 
-# Compare matched LM-head LoRA and RoAd capacities. LoRA alpha is tied to rank
-# so its adapter scaling remains constant across the rank grid.
+# Test whether the best output-only adapter directions succeed once their much
+# smaller raw logit differences are scaled to the all-layer LoRA regime.
 parameters:
   trainer.args.seed:
     value: 42
   trainer.args.learning_rate:
-    values: [1.0e-4, 1.0e-3]
+    value: 1.0e-3
   trainer.method_args.adapter_type:
     values: [lm_head_lora, road]
   trainer.method_args.rank:
-    values: [1, 2, 4]
+    value: 1
   trainer.method_args.difference_reference:
     value: base
   trainer.method_args.correction_mode:
     value: suppression
   trainer.method_args.diagnostic_strengths:
-    value: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0]
+    value: [20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0]
 
 command:
   - uv
