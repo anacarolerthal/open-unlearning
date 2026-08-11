@@ -101,7 +101,7 @@ class RoadBlock(UnlearnTrainer):
         retain = self.train_dataset.retain
         retain_indices = torch.linspace(
             0, len(retain) - 1, steps=min(len(forget), len(retain))
-        ).long()
+        ).long().tolist()
         forget_embeddings = self._embed_dataset(forget)
         retain_embeddings = self._embed_dataset(Subset(retain, retain_indices))
         self.classifier.fit(forget_embeddings, retain_embeddings)
