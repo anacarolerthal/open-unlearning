@@ -1,0 +1,13 @@
+defaults:
+  - finetune
+
+handler: RoadBlock
+method_args:
+  strength: 42.0
+  classifier: oracle
+
+args:
+  learning_rate: 1.0e-3
+  num_train_epochs: 10
+  eval_strategy: 'no'
+  eval_on_start: False

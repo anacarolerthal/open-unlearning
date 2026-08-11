@@ -1,9 +1,9 @@
-# @package eval.tofu.metrics.lora_diff_diagnostics
+# @package eval.tofu.metrics.roadblock_diagnostics
 defaults:
   - ../../data/datasets@datasets: TOFU_QA_forget
   - ../../collator@collators: DataCollatorForSupervisedDatasetwithIndex
 
-handler: lora_diff_diagnostics
+handler: roadblock_diagnostics
 batch_size: 1
 
 datasets:

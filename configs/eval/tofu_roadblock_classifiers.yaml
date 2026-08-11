@@ -6,10 +6,10 @@ defaults:
     - forget_quality
     - forget_Q_A_Prob
     - forget_Q_A_ROUGE
-    - extraction_strength
-    - mia_min_k
+    - model_utility
     - privleak
-    - lora_diff_diagnostics
+    - extraction_strength
+    - roadblock_classifier_quality
 
 handler: TOFUEvaluator
 output_dir: ${paths.output_dir}
@@ -18,5 +18,5 @@ overwrite: true
 forget_split: forget10
 holdout_split: holdout10
 retain_logs_path: null
-question_key: "question"
+question_key: question
 batch_size: 32

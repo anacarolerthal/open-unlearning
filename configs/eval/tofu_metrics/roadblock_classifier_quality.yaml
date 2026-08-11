@@ -1,0 +1,58 @@
+# @package eval.tofu.metrics.roadblock_classifier_quality
+defaults:
+  - ../../collator@collators: DataCollatorForSupervisedDatasetwithIndex
+
+handler: roadblock_classifier_quality
+batch_size: ${eval.tofu.batch_size}
+
+datasets:
+  forget_original:
+    handler: QADataset
+    args:
+      hf_args:
+        path: locuslab/TOFU
+        name: ${eval.tofu.forget_split}_perturbed
+        split: train
+      question_key: question
+      answer_key: answer
+      max_length: 512
+  forget_paraphrased:
+    handler: QADataset
+    args:
+      hf_args:
+        path: locuslab/TOFU
+        name: ${eval.tofu.forget_split}_perturbed
+        split: train
+      question_key: paraphrased_question
+      answer_key: answer
+      max_length: 512
+  holdout:
+    handler: QADataset
+    args:
+      hf_args:
+        path: locuslab/TOFU
+        name: ${eval.tofu.holdout_split}
+        split: train
+      question_key: question
+      answer_key: answer
+      max_length: 512
+  real_authors:
+    handler: QADataset
+    args:
+      hf_args:
+        path: locuslab/TOFU
+        name: real_authors_perturbed
+        split: train
+      question_key: question
+      answer_key: answer
+      max_length: 512
+  world_facts:
+    handler: QADataset
+    args:
+      hf_args:
+        path: locuslab/TOFU
+        name: world_facts_perturbed
+        split: train
+      question_key: question
+      answer_key: answer
+      max_length: 512

@@ -68,15 +68,12 @@ class UnlearningMetric:
             raise ValueError(f"{file} doesn't exist!")
         return logs
 
-    def prepare_kwargs_evaluate_metric(self, model, metric_name, cache=None, **kwargs):
+    def prepare_kwargs_evaluate_metric(self, model, metric_name, cache={}, **kwargs):
         """Prepare the kwargs required to call the metric_fn defined by user.
         - Loads datasets, collators, results for pre_compute metrics
         Returns:
             Dict: Updated kwargs with datasets, collators, pre_compute results loaded
         """
-        if cache is None:
-            cache = {}
-
         # Load datasets
         dataset_cfgs = kwargs.pop("datasets", None)
         if dataset_cfgs is not None:
