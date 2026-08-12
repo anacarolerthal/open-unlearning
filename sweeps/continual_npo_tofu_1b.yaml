@@ -7,7 +7,7 @@ metric:
 
 parameters:
   trainer.args.seed:
-    values: [42, 43, 44]
+    values: [42]
   trainer.args.learning_rate:
     values: [1.0e-6, 3.0e-6, 1.0e-5]
   trainer.args.max_steps:
