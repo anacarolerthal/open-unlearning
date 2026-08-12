@@ -140,13 +140,21 @@ class RoadBlock(UnlearnTrainer):
         return base_logits - self.strength * F.relu(divergence)
 
     def _route(self, kwargs):
-        attention_mask = kwargs["attention_mask"]
-        incremental = attention_mask.shape[1] != self._classifier_hidden.shape[1]
-        if incremental and self._route_cache is not None:
+        cache_position = kwargs.get("cache_position")
+        incremental = (
+            cache_position is not None
+            and cache_position.numel() > 0
+            and cache_position[0].item() > 0
+        )
+        if (
+            incremental
+            and self._route_cache is not None
+            and len(self._route_cache) == len(self._classifier_hidden)
+        ):
             return self._route_cache
 
         embeddings = self._pool_prompt(
-            self._classifier_hidden, attention_mask, kwargs.get("labels")
+            self._classifier_hidden, kwargs["attention_mask"], kwargs.get("labels")
         )
         _, route = self.classifier.predict(embeddings)
         self._route_cache = route
