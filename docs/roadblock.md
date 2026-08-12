@@ -1,28 +1,27 @@
 # RoAdBlock
 
-**RoAdBlock** (Routed Output-Adapter Difference Blocking) is a one-backbone-pass
-unlearning intervention. It uses a tiny RoAd adapter as a probe for memorized
-knowledge, then suppresses the evidence exposed by that probe.
+**RoAdBlock** (Routed Output-Adapter Difference Blocking) is a lightweight
+generation-time unlearning method. It uses a RoAd adapter to identify
+forget-specific output evidence and a small prompt router to suppress that
+evidence only for matching requests.
 
 ## Method
 
-Let the frozen target model produce
+Let the frozen target model produce hidden states $h_t$ and logits
 
 $$
-z_0(x,t)=W h_\theta(x_{\leq t}),
+z_0(x,t)=W h_t.
 $$
 
-where the target model was trained on the forget data. A RoAd-1 transform
-$R_\phi$ is attached only to the language-model output and trained with
-cross-entropy on the forget set:
+A RoAd-1 adapter $R_\phi$, attached only to the LM head, is trained with
+cross-entropy on the forget set $D_F$:
 
 $$
 \phi^*=\arg\min_\phi\sum_{(x,y)\in D_F}
 \operatorname{CE}(R_\phi z_0(x),y).
 $$
 
-RoAd is a block-diagonal rotation and scaling of the vocabulary logits. For
-each paired coordinate,
+RoAd applies a learned rotation and scaling to each pair of vocabulary logits:
 
 $$
 R_i=\alpha_i
@@ -32,84 +31,114 @@ R_i=\alpha_i
 \end{bmatrix}.
 $$
 
-The trained adapter exposes positive forget-specific evidence
+The adapter-induced increase
 
 $$
-d_\phi(x,t)=R_{\phi^*}z_0(x,t)-z_0(x,t).
+d_\phi(x,t)=R_{\phi^*}z_0(x,t)-z_0(x,t)
 $$
 
-Given a router $g(x)\in\{0,1\}$, inference applies one-sided suppression:
+acts as a probe for forget-specific evidence. RoAdBlock suppresses only its
+positive coordinates:
 
 $$
-\boxed{\quad z_{\text{out}}(x,t)=z_0(x,t)
--\lambda g(x)\,[d_\phi(x,t)]_+\quad}.
+\boxed{
+z_{\mathrm{out}}(x,t)=z_0(x,t)
+-\lambda g(x)\,[d_\phi(x,t)]_+
+}.
 $$
 
-The confirmed experiment used an oracle router: $g(x)=1$ for forget examples
-and zero otherwise. The implementation now supports four router MVPs:
+The router is a GUARD-style MLP over the normalized final prompt-token hidden
+state $e(x)$:
 
 $$
-g(x)=\begin{cases}
-\mathbb{1}[x\in D_F] & \text{oracle},\\
-1 & \text{no classifier},\\
-\mathbb{1}[\sigma(\operatorname{MLP}(e(x)))\geq 0.5] & \text{GUARD-style},\\
-\mathbb{1}[\max_{f\in D_F}\cos(e(x),e(f))\geq\delta] & \text{CURaTE-style}.
-\end{cases}
+g(x)=\mathbb{1}
+\left[\sigma \left(w_2^\top
+\operatorname{LN}(\operatorname{ReLU}(W_1 e(x)))\right)\geq 0.5\right].
 $$
 
-Here $e(x)$ is the final prompt-token hidden state. The GUARD-style router
-trains a one-hidden-layer MLP on all forget and retain embeddings, using
-inverse-frequency loss weighting. The
-CURaTE-style router stores forget embeddings and calibrates $\delta$ on all
-forget and retain examples. These are deliberately minimal variants, not exact
-reproductions of [GUARD](https://arxiv.org/abs/2505.13312) or
-[CURaTE](https://arxiv.org/abs/2604.14644).
+It has one 128-unit hidden layer and is trained on all forget and retain
+examples using inverse-frequency-weighted binary cross-entropy. This is a
+minimal GUARD-style router, not an exact reproduction of
+[GUARD](https://arxiv.org/abs/2505.13312): GUARD uses mean pooling and a much
+larger augmented routing dataset, while RoAdBlock uses the final prompt token so
+that routing and correction share the target model's single backbone pass.
 
-The confirmed adapter configuration is RoAd-1, learning rate $10^{-3}$, 10
-epochs, and $\lambda=42$.
+The finalized TOFU configuration is:
 
-Both $z_0$ and $R_\phi z_0$ come from the same backbone output. RoAdBlock
-therefore needs one backbone pass, preserves the KV cache, and stores 128,256
-trainable parameters for Llama-3.2-1B (about 251 KiB in BF16).
+- Llama-3.2-1B-Instruct trained on TOFU-full;
+- TOFU forget10 and retain90;
+- RoAd-1 on `lm_head`, group size 64;
+- adapter learning rate $10^{-3}$ for 10 epochs;
+- suppression strength $\lambda=42$;
+- GUARD-style MLP threshold 0.5.
+
+Both $z_0$ and $R_\phi z_0$ are computed from the same backbone output.
+RoAdBlock therefore requires one backbone pass, preserves the KV cache, and
+adds 128,256 RoAd parameters plus 262,657 router parameters. The RoAd transform
+itself occupies about 251 KiB in BF16.
 
 ## Results
 
-The confirmation sweep used TOFU forget10 and three independently trained
-adapters. All three selected $\lambda=42$.
+The final sweep trained three independent RoAdBlock instances on TOFU forget10
+with seeds 42, 43, and 44.
+
+### Unlearning
 
 | Metric | Mean | Seed range |
 |---|---:|---:|
-| Forget quality (KS p-value) | 0.719 | 0.641--0.758 |
-| KS statistic (lower is better) | 0.049 | 0.0475--0.0525 |
+| Forget quality (KS p-value; higher is better) | **0.719** | 0.641--0.758 |
+| Forget-quality KS statistic (lower is better) | **0.049** | 0.0475--0.0525 |
+| Model utility | **0.591** | 0.590--0.592 |
 | Forget ROUGE-L recall | 0.256 | 0.252--0.261 |
 | Forget answer probability | 0.0260 | 0.0253--0.0268 |
 | Extraction strength | 0.0616 | 0.0615--0.0618 |
-| PrivLeak | +53.8 | +53.5--+54.3 |
+| PrivLeak | +48.45 | +48.06--+49.17 |
 
-The forget-quality result is substantially stronger and more stable than the
-tested output-only LM-head LoRA (best p-value 0.000775) and all-linear LoRA Diff
-(mean best p-value 0.193). It also exceeds the reproduced NPO forget-quality
-p-value of 0.02, although the oracle router makes this an upper-bound experiment
-rather than a deployable comparison.
+At the same adapter configuration, the oracle router obtained forget quality
+0.758 and utility 0.600. The learned router therefore reaches near-oracle
+forgetting while retaining 98.6% of oracle utility. The variation in the KS
+p-value is larger than the variation in its underlying statistic, which remains
+between 0.0475 and 0.0525.
 
-The reduced sweep measured forget behavior only. For oracle-negative inputs,
-$g(x)=0$ makes the output exactly equal to the target model. Privacy remains
-the main weakness: RoAdBlock changes or obscures answers effectively, but does
-not yet match the retain model under membership-inference metrics.
+### Routing
 
-Results: [W&B sweep `38o2opf7`](https://wandb.ai/juanbelieni-lab/open-unlearning/sweeps/38o2opf7).
+| Metric | Mean across seeds |
+|---|---:|
+| Balanced accuracy | **91.4%** |
+| Forget recall (original and paraphrased average) | **95.0%** |
+| Forget-original recall | **100.0%** |
+| Forget-paraphrased recall | **90.0%** |
+| Holdout positive rate | **7.5%** |
+| Real-author positive rate | 11.3% |
+| World-fact positive rate | 17.7% |
 
-## Before continual unlearning
+Compared with the earlier linear, mean-pooled router, the final MLP reduced the
+holdout positive rate from 25.75% to 7.5%, increased original-forget recall from
+93.5% to 100%, and raised model utility from 0.546 to 0.591.
 
-1. **Validate routing.** Compare the router MVPs on false positives, paraphrase
-   recall, threshold calibration, latency, and adversarial bypasses.
-2. **Validate the candidate.** Run the complete TOFU evaluation once, repeat on
-   other forget splits and models, and report privacy alongside behavioral
-   forgetting.
-3. **Build an adapter bank.** Store one RoAd transform and router key per request;
-   define routing when zero, one, or several requests match the same prompt.
-4. **Test sequentially.** Add forget requests one at a time and re-evaluate every
-   previous request, retain utility, router errors, latency, and bytes per request.
-5. **Compare continual baselines.** Match O3 and related methods on quality while
-   reporting the advantages RoAdBlock targets directly: one backbone pass,
-   KV-cache compatibility, transparent routing, and small per-request state.
+Raising the routing threshold did not provide a meaningful free improvement.
+At threshold 0.9, the macro false-positive rate fell from 12.2% to 9.9%, but
+paraphrase recall fell from 90.0% to 86.8%. We therefore retain the natural
+threshold of 0.5.
+
+These results support RoAdBlock as a behavioral, safety-oriented intervention.
+They do not establish privacy-equivalent data deletion: the remaining PrivLeak
+signal must be reported separately from behavioral forgetting.
+
+Results: [W&B sweep `2yaxtuaz`](https://wandb.ai/juanbelieni-lab/open-unlearning/sweeps/2yaxtuaz).
+
+## Next: continual unlearning
+
+The single-request method is now fixed. The next experiment will test an adapter
+bank containing one RoAd transform and routing entry per forget request.
+
+1. Add forget requests sequentially without retraining the backbone.
+2. Route each prompt to zero, one, or multiple adapters and define a simple
+   composition rule when several requests match.
+3. After every addition, evaluate all previous forget requests, retain utility,
+   router false positives, and interference between adapters.
+4. Measure per-request storage, router and adapter latency, and total generation
+   overhead while preserving one backbone pass and the KV cache.
+5. Compare against O3 and other continual-unlearning methods on quality, while
+   emphasizing RoAdBlock's smaller state, explicit routing, and interpretable
+   logit-level suppression.
