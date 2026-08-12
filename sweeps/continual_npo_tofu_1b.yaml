@@ -29,7 +29,7 @@ command:
   - trainer.args.gradient_accumulation_steps=4
   - trainer.args.weight_decay=0.01
   - +trainer.args.warmup_epochs=1.0
-  - trainer.args.lr_scheduler_type=linear
+  - +trainer.args.lr_scheduler_type=linear
   - trainer.args.report_to=wandb
   - seed=${trainer.args.seed}
   - task_name=sweep_continual_npo_seed${trainer.args.seed}_${oc.env:WANDB_RUN_ID}

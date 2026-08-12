@@ -73,13 +73,18 @@ def test_continual_stage_keeps_nested_batches_and_accepts_npo_warmup(tmp_path):
     with initialize_config_dir(version_base=None, config_dir=config_dir):
         config = compose(
             config_name="continual_unlearn.yaml",
-            overrides=["trainer=NPO", "+trainer.args.warmup_epochs=1.0"],
+            overrides=[
+                "trainer=NPO",
+                "+trainer.args.warmup_epochs=1.0",
+                "+trainer.args.lr_scheduler_type=linear",
+            ],
         )
 
     stage = _stage_trainer_config(config, tmp_path, "request_01")
 
     assert stage.args.remove_unused_columns is False
     assert stage.args.warmup_epochs == 1.0
+    assert stage.args.lr_scheduler_type == "linear"
 
 
 def test_npo_next_stage_uses_live_model_and_current_reference(tmp_path):
