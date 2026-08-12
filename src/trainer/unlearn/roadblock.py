@@ -3,7 +3,7 @@ from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
-from peft import RoadConfig, TaskType, get_peft_model
+from peft import PeftModel, RoadConfig, TaskType, get_peft_model
 from torch.utils.data import DataLoader
 from peft.tuners.road.layer import _apply_road
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
@@ -16,25 +16,41 @@ from trainer.wandb_utils import log_wandb_artifact
 class RoadBlock(UnlearnTrainer):
     """Routed suppression using a RoAd probe on the language-model head."""
 
-    def __init__(self, strength=42.0, classifier="oracle", model=None, *args, **kwargs):
+    def __init__(
+        self,
+        strength=42.0,
+        classifier="oracle",
+        request_name="forget",
+        model=None,
+        *args,
+        **kwargs,
+    ):
         config = RoadConfig(
             task_type=TaskType.CAUSAL_LM,
             variant="road_1",
             group_size=64,
             target_modules=["lm_head"],
         )
-        model = get_peft_model(model, config, adapter_name="forget")
+        if isinstance(model, PeftModel):
+            if request_name in model.peft_config:
+                raise ValueError(f"RoAdBlock request already exists: {request_name}")
+            model.add_adapter(request_name, config)
+            model.set_adapter(request_name)
+        else:
+            model = get_peft_model(model, config, adapter_name=request_name)
         super().__init__(*args, model=model, **kwargs)
 
         if not self.label_names:
             self.label_names = ["labels"]
         self.model_accepts_loss_kwargs = False
         self.strength = float(strength)
+        self.request_name = request_name
         self.classifier = RoadBlockClassifier(
             classifier, model.config.hidden_size, self.model.device
         )
         self._trained = False
         self._is_forget = False
+        self._active_request = None
         self._skip_correction = False
         self._classifier_hidden = None
         self._route_cache = None
@@ -46,15 +62,34 @@ class RoadBlock(UnlearnTrainer):
         self.model.roadblock_classifier_threshold = lambda: self.classifier.threshold
 
     @contextmanager
-    def classifier_context(self, is_forget):
-        previous = self._is_forget
-        self._is_forget = bool(is_forget)
+    def classifier_context(self, route):
+        previous_is_forget = self._is_forget
+        previous_request = self._active_request
+        if self.classifier.mode == "oracle":
+            if isinstance(route, bool):
+                self._active_request = (
+                    (previous_request or self.request_name) if route else None
+                )
+            else:
+                self._active_request = route
+        else:
+            self._is_forget = bool(route)
         self._route_cache = None
         try:
             yield
         finally:
-            self._is_forget = previous
+            self._is_forget = previous_is_forget
+            self._active_request = previous_request
             self._route_cache = None
+
+    @contextmanager
+    def request_evaluation_context(self, request_name):
+        """Apply the oracle adapter for one request, or no adapter for utility."""
+        if request_name is not None and request_name not in self.model.peft_config:
+            raise ValueError(f"Unknown RoAdBlock request: {request_name}")
+        with self._apply_forget_correction():
+            with self.classifier_context(request_name):
+                yield
 
     @staticmethod
     def _final_prompt_token(hidden, attention_mask, labels=None):
@@ -121,20 +156,21 @@ class RoadBlock(UnlearnTrainer):
         self._trained = True
         return output
 
-    def _road_logits(self, base_logits):
+    def _road_logits(self, base_logits, request_name=None):
+        request_name = request_name or self.request_name
         output_layer = self.model.get_base_model().get_output_embeddings()
-        theta = output_layer.road_theta["forget"]
+        theta = output_layer.road_theta[request_name]
         logits = _apply_road(
-            output_layer.variant["forget"],
-            output_layer.group_size["forget"],
+            output_layer.variant[request_name],
+            output_layer.group_size[request_name],
             theta,
-            output_layer.road_alpha["forget"],
+            output_layer.road_alpha[request_name],
             base_logits.to(theta.dtype),
         )
         return logits.to(base_logits.dtype)
 
-    def _correct(self, base_logits):
-        divergence = self._road_logits(base_logits) - base_logits
+    def _correct(self, base_logits, request_name=None):
+        divergence = self._road_logits(base_logits, request_name) - base_logits
         return base_logits - self.strength * F.relu(divergence)
 
     def _route(self, kwargs):
@@ -178,18 +214,19 @@ class RoadBlock(UnlearnTrainer):
             if self._skip_correction or getattr(output, "_roadblock_corrected", False):
                 return output
 
-            if self.classifier.mode == "oracle" and not self._is_forget:
-                output._roadblock_corrected = True
-                return output
-
-            corrected_logits = self._correct(output.logits)
-            if self.classifier.needs_embeddings:
+            if self.classifier.mode == "oracle":
+                if self._active_request is None:
+                    output._roadblock_corrected = True
+                    return output
+                output.logits = self._correct(output.logits, self._active_request)
+            elif self.classifier.needs_embeddings:
+                corrected_logits = self._correct(output.logits)
                 route = self._route(kwargs)
                 output.logits = torch.where(
                     route[:, None, None], corrected_logits, output.logits
                 )
             else:
-                output.logits = corrected_logits
+                output.logits = self._correct(output.logits)
             labels = kwargs.get("labels")
             if labels is not None:
                 output.loss = self._causal_lm_loss(output.logits, labels)
@@ -262,7 +299,8 @@ class RoadBlock(UnlearnTrainer):
                 )
                 continue
 
-            divergence = self._road_logits(base) - base
+            request_name = self._active_request or self.request_name
+            divergence = self._road_logits(base, request_name) - base
             positive = F.relu(divergence)
             target_divergence = divergence.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
             target_suppression = positive.gather(-1, targets.unsqueeze(-1)).squeeze(-1)

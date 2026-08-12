@@ -1,0 +1,25 @@
+program: src/continual_unlearn.py
+project: continual-open-unlearning
+method: grid
+metric:
+  name: eval/continual_forget_quality
+  goal: maximize
+
+parameters:
+  trainer.args.seed:
+    values: [42, 43, 44]
+
+command:
+  - uv
+  - run
+  - python
+  - src/continual_unlearn.py
+  - --config-name=continual_unlearn.yaml
+  - trainer=RoadBlock
+  - model=Llama-3.2-1B-Instruct
+  - model.model_args.pretrained_model_name_or_path=open-unlearning/tofu_Llama-3.2-1B-Instruct_full
+  - model.model_args.attn_implementation=sdpa
+  - trainer.args.report_to=wandb
+  - seed=${trainer.args.seed}
+  - task_name=sweep_continual_roadblock_seed${trainer.args.seed}_${oc.env:WANDB_RUN_ID}
+  - ${args_no_hyphens}
