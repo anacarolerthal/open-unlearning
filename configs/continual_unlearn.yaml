@@ -54,3 +54,4 @@ trainer:
     eval_strategy: 'no'
     eval_on_start: false
     save_strategy: 'no'
+    remove_unused_columns: false
