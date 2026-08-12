@@ -16,7 +16,15 @@ class RoadBlockClassifier:
         self.mode = mode
         self.device = device
         self.head = (
-            nn.Linear(hidden_size, 1, device=device) if mode == "guard" else None
+            nn.Sequential(
+                nn.Linear(hidden_size, 128),
+                nn.ReLU(),
+                nn.LayerNorm(128),
+                nn.Dropout(0.1),
+                nn.Linear(128, 1),
+            ).to(device)
+            if mode == "guard"
+            else None
         )
         self.forget_embeddings = None
         self.threshold = 0.5
@@ -42,10 +50,14 @@ class RoadBlockClassifier:
                 ]
             )
             optimizer = torch.optim.AdamW(self.head.parameters(), lr=1e-2)
+            positive_weight = torch.tensor(
+                len(retain_embeddings) / len(forget_embeddings), device=self.device
+            )
             self.head.train()
             for _ in range(100):
+                logits = self.head(features).squeeze(-1)
                 loss = F.binary_cross_entropy_with_logits(
-                    self.head(features).squeeze(-1), labels
+                    logits, labels, pos_weight=positive_weight
                 )
                 optimizer.zero_grad()
                 loss.backward()

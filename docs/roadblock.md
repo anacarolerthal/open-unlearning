@@ -52,14 +52,15 @@ $$
 g(x)=\begin{cases}
 \mathbb{1}[x\in D_F] & \text{oracle},\\
 1 & \text{no classifier},\\
-\mathbb{1}[\sigma(w^\top e(x)+b)\geq 0.5] & \text{GUARD-style},\\
+\mathbb{1}[\sigma(\operatorname{MLP}(e(x)))\geq 0.5] & \text{GUARD-style},\\
 \mathbb{1}[\max_{f\in D_F}\cos(e(x),e(f))\geq\delta] & \text{CURaTE-style}.
 \end{cases}
 $$
 
-Here $e(x)$ is the mean-pooled final hidden state of the prompt. The GUARD-style
-router trains a linear head on balanced forget and retain embeddings. The
-CURaTE-style router stores forget embeddings and calibrates $\delta$ on balanced
+Here $e(x)$ is the final prompt-token hidden state. The GUARD-style router
+trains a one-hidden-layer MLP on all forget and retain embeddings, using
+inverse-frequency loss weighting. The
+CURaTE-style router stores forget embeddings and calibrates $\delta$ on all
 forget and retain examples. These are deliberately minimal variants, not exact
 reproductions of [GUARD](https://arxiv.org/abs/2505.13312) or
 [CURaTE](https://arxiv.org/abs/2604.14644).

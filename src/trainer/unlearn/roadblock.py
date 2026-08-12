@@ -4,7 +4,7 @@ from contextlib import contextmanager
 import torch
 import torch.nn.functional as F
 from peft import RoadConfig, TaskType, get_peft_model
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from peft.tuners.road.layer import _apply_road
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
@@ -57,16 +57,17 @@ class RoadBlock(UnlearnTrainer):
             self._route_cache = None
 
     @staticmethod
-    def _pool_prompt(hidden, attention_mask, labels=None):
+    def _final_prompt_token(hidden, attention_mask, labels=None):
         attention_mask = attention_mask[:, -hidden.shape[1] :].bool()
-        if labels is not None and labels.shape[1] == hidden.shape[1]:
-            prompt_mask = attention_mask & labels.eq(-100)
+        if labels is not None:
+            prompt_mask = attention_mask & labels[:, -hidden.shape[1] :].eq(-100)
         else:
             prompt_mask = attention_mask
         empty = ~prompt_mask.any(dim=-1)
         prompt_mask[empty] = attention_mask[empty]
-        weights = prompt_mask.unsqueeze(-1).to(hidden.dtype)
-        return (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
+        positions = torch.arange(hidden.shape[1], device=hidden.device)
+        prompt_end = positions.masked_fill(~prompt_mask, -1).argmax(dim=-1)
+        return hidden[torch.arange(len(hidden), device=hidden.device), prompt_end]
 
     @torch.no_grad()
     def _embed_batch(self, batch):
@@ -82,7 +83,7 @@ class RoadBlock(UnlearnTrainer):
             use_cache=False,
             return_dict=True,
         ).last_hidden_state
-        return self._pool_prompt(
+        return self._final_prompt_token(
             hidden, batch["attention_mask"], batch.get("labels")
         ).cpu()
 
@@ -99,11 +100,8 @@ class RoadBlock(UnlearnTrainer):
             return
         forget = self.train_dataset.forget
         retain = self.train_dataset.retain
-        retain_indices = torch.linspace(
-            0, len(retain) - 1, steps=min(len(forget), len(retain))
-        ).long().tolist()
         forget_embeddings = self._embed_dataset(forget)
-        retain_embeddings = self._embed_dataset(Subset(retain, retain_indices))
+        retain_embeddings = self._embed_dataset(retain)
         self.classifier.fit(forget_embeddings, retain_embeddings)
 
     def compute_loss(
@@ -153,7 +151,7 @@ class RoadBlock(UnlearnTrainer):
         ):
             return self._route_cache
 
-        embeddings = self._pool_prompt(
+        embeddings = self._final_prompt_token(
             self._classifier_hidden, kwargs["attention_mask"], kwargs.get("labels")
         )
         _, route = self.classifier.predict(embeddings)
