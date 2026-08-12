@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-uv run wandb agent juanbelieni-lab/continual-open-unlearning/15odfkz7
-uv run wandb agent juanbelieni-lab/continual-open-unlearning/a9k0n0bf
+uv run wandb agent juanbelieni-lab/continual-open-unlearning/9c91w5vl
+uv run wandb agent juanbelieni-lab/continual-open-unlearning/6phkvl4z

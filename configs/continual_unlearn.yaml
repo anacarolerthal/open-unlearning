@@ -55,3 +55,8 @@ trainer:
     eval_on_start: false
     save_strategy: 'no'
     remove_unused_columns: false
+    # Keep sweep-tuned TrainingArguments keys in the structured config so
+    # W&B's args_no_hyphens macro can emit concrete overrides.
+    max_steps: -1
+    warmup_ratio: 0.0
+    lr_scheduler_type: linear

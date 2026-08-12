@@ -30,12 +30,9 @@ command:
   - trainer.args.per_device_train_batch_size=8
   - trainer.args.gradient_accumulation_steps=4
   - trainer.args.weight_decay=0.01
-  - +trainer.args.warmup_ratio=0.1
-  - +trainer.args.lr_scheduler_type=linear
+  - trainer.args.warmup_ratio=0.1
+  - trainer.args.lr_scheduler_type=linear
   - trainer.args.report_to=wandb
-  - trainer.args.learning_rate=${trainer.args.learning_rate}
-  - +trainer.args.max_steps=${trainer.args.max_steps}
-  - trainer.method_args.strength=${trainer.method_args.strength}
-  - trainer.args.seed=${trainer.args.seed}
   - seed=${trainer.args.seed}
   - task_name=sweep_continual_roadblock_seed${trainer.args.seed}_${oc.env:WANDB_RUN_ID}
+  - ${args_no_hyphens}
