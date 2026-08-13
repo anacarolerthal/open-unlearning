@@ -76,6 +76,13 @@ def _validate_runtime(cfg):
         )
     if cfg.trainer.handler not in {"NPO", "RoadBlock"}:
         raise ValueError("trainer must be NPO or RoadBlock")
+    if cfg.trainer.handler == "RoadBlock":
+        classifier = cfg.trainer.method_args.get("classifier", "oracle")
+        if classifier not in {"oracle", "guard_multiclass", "guard_prototype"}:
+            raise ValueError(
+                "Continual RoadBlock classifiers must be oracle, "
+                "guard_multiclass, or guard_prototype"
+            )
 
     reference_path = Path(to_absolute_path(cfg.retain_logs_path))
     if not reference_path.exists():
@@ -103,6 +110,7 @@ def _stage_trainer_config(cfg, stage_dir, request_name):
         trainer_cfg.args.save_strategy = "no"
         if trainer_cfg.handler == "RoadBlock":
             trainer_cfg.method_args.request_name = request_name
+            trainer_cfg.method_args.continual = True
     return trainer_cfg
 
 
@@ -167,6 +175,8 @@ def main(cfg: DictConfig):
         "forget_split": cfg.forget_split,
         "retain_split": cfg.retain_split,
         "holdout_split": cfg.holdout_split,
+        "classifier": cfg.trainer.get("method_args", {}).get("classifier", "oracle"),
+        "num_centroids": cfg.trainer.get("method_args", {}).get("num_centroids", 2),
         "requests": partitions,
         "stages": {},
     }

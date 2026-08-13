@@ -21,10 +21,26 @@ class RoadBlock(UnlearnTrainer):
         strength=42.0,
         classifier="oracle",
         request_name="forget",
+        continual=False,
+        num_centroids=2,
         model=None,
         *args,
         **kwargs,
     ):
+        if classifier not in RoadBlockClassifier.MODES:
+            raise ValueError(
+                f"classifier must be one of {sorted(RoadBlockClassifier.MODES)}, "
+                f"got {classifier}"
+            )
+        if continual and classifier == "guard":
+            raise ValueError(
+                "classifier=guard is for ordinary single-request runs; "
+                "use guard_multiclass or guard_prototype for continual unlearning"
+            )
+        if not continual and classifier in RoadBlockClassifier.CONTINUAL_MODES:
+            raise ValueError(
+                f"classifier={classifier} requires the continual unlearning runner"
+            )
         config = RoadConfig(
             task_type=TaskType.CAUSAL_LM,
             variant="road_1",
@@ -45,8 +61,20 @@ class RoadBlock(UnlearnTrainer):
         self.model_accepts_loss_kwargs = False
         self.strength = float(strength)
         self.request_name = request_name
+        self.continual = bool(continual)
+        self.num_centroids = int(num_centroids)
         self.classifier = RoadBlockClassifier(
-            classifier, model.config.hidden_size, self.model.device
+            classifier,
+            model.config.hidden_size,
+            self.model.device,
+            request_name=request_name,
+            request_names=list(
+                getattr(model, "_roadblock_activation_cache", {})
+                .get("forget", {})
+            ),
+            num_centroids=self.num_centroids,
+            seed=int(self.args.seed),
+            continual=self.continual,
         )
         self._trained = False
         self._is_forget = False
@@ -55,6 +83,12 @@ class RoadBlock(UnlearnTrainer):
         self._classifier_hidden = None
         self._route_cache = None
         self._reference_uploaded = False
+
+        if self.continual and not hasattr(self.model, "_roadblock_activation_cache"):
+            self.model._roadblock_activation_cache = {
+                "retain": None,
+                "forget": {},
+            }
 
         self.model.unlearn_classifier_context = self.classifier_context
         self.model.roadblock_diagnostic_batch = self.diagnostic_batch
@@ -84,7 +118,7 @@ class RoadBlock(UnlearnTrainer):
 
     @contextmanager
     def request_evaluation_context(self, request_name):
-        """Apply the oracle adapter for one request, or no adapter for utility."""
+        """Evaluate one request, or utility when ``request_name`` is ``None``."""
         if request_name is not None and request_name not in self.model.peft_config:
             raise ValueError(f"Unknown RoAdBlock request: {request_name}")
         with self._apply_forget_correction():
@@ -135,6 +169,16 @@ class RoadBlock(UnlearnTrainer):
             return
         forget = self.train_dataset.forget
         retain = self.train_dataset.retain
+        if self.continual:
+            cache = self.model._roadblock_activation_cache
+            if cache["retain"] is None:
+                cache["retain"] = self._embed_dataset(retain).float().cpu()
+            if self.request_name not in cache["forget"]:
+                cache["forget"][self.request_name] = (
+                    self._embed_dataset(forget).float().cpu()
+                )
+            self.classifier.fit_replay(cache)
+            return
         forget_embeddings = self._embed_dataset(forget)
         retain_embeddings = self._embed_dataset(retain)
         self.classifier.fit(forget_embeddings, retain_embeddings)
@@ -190,9 +234,9 @@ class RoadBlock(UnlearnTrainer):
         embeddings = self._final_prompt_token(
             self._classifier_hidden, kwargs["attention_mask"], kwargs.get("labels")
         )
-        _, route = self.classifier.predict(embeddings)
-        self._route_cache = route
-        return route
+        _, routes = self.classifier.route(embeddings)
+        self._route_cache = routes
+        return routes
 
     @staticmethod
     def _causal_lm_loss(logits, labels):
@@ -220,11 +264,20 @@ class RoadBlock(UnlearnTrainer):
                     return output
                 output.logits = self._correct(output.logits, self._active_request)
             elif self.classifier.needs_embeddings:
-                corrected_logits = self._correct(output.logits)
-                route = self._route(kwargs)
-                output.logits = torch.where(
-                    route[:, None, None], corrected_logits, output.logits
-                )
+                routes = self._route(kwargs)
+                corrected_logits = output.logits.clone()
+                for request_name in dict.fromkeys(
+                    route for route in routes if route is not None
+                ):
+                    mask = torch.tensor(
+                        [route == request_name for route in routes],
+                        device=output.logits.device,
+                        dtype=torch.bool,
+                    )
+                    corrected_logits[mask] = self._correct(
+                        output.logits[mask], request_name
+                    )
+                output.logits = corrected_logits
             else:
                 output.logits = self._correct(output.logits)
             labels = kwargs.get("labels")
@@ -254,17 +307,30 @@ class RoadBlock(UnlearnTrainer):
         if self.classifier.mode == "oracle":
             scores = torch.full((batch_size,), float(is_forget))
             predictions = scores.bool()
-        elif self.classifier.mode == "none":
-            scores = torch.ones(batch_size)
-            predictions = scores.bool()
         else:
             embeddings = self._embed_batch(inputs)
-            scores, predictions = self.classifier.predict(embeddings)
+            scores, routes = self.classifier.route(embeddings)
+            predictions = torch.tensor(
+                [route is not None for route in routes], dtype=torch.bool
+            )
             scores = scores.cpu()
-            predictions = predictions.cpu()
+            details = routes
+        if self.classifier.mode == "oracle":
+            details = [
+                (self._active_request or self.request_name) if is_forget else None
+            ] * batch_size
+        elif self.classifier.mode == "guard":
+            details = [
+                self.request_name if prediction else None
+                for prediction in predictions
+            ]
         return [
-            {"score": float(score), "prediction": bool(prediction)}
-            for score, prediction in zip(scores, predictions)
+            {
+                "score": float(score),
+                "prediction": bool(prediction),
+                "request_name": request_name,
+            }
+            for score, prediction, request_name in zip(scores, predictions, details)
         ]
 
     @torch.no_grad()

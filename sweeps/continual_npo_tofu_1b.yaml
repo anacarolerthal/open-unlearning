@@ -2,20 +2,23 @@ program: src/continual_unlearn.py
 project: continual-open-unlearning
 method: grid
 metric:
-  name: eval/continual_forget_Q_A_Prob
-  goal: minimize
+  # Select distributionally valid forgetting; answer probability alone
+  # favored catastrophic over-unlearning in the exploratory sweep.
+  name: eval/continual_forget_quality
+  goal: maximize
 
 parameters:
   trainer.args.seed:
-    values: [42]
+    # Fresh confirmation seeds; seed 42 was used to identify this region.
+    values: [43, 44, 45, 46, 47]
   trainer.args.learning_rate:
-    values: [1.0e-6, 3.0e-6, 1.0e-5]
+    values: [7.5e-6, 1.0e-5, 1.25e-5]
   trainer.args.max_steps:
-    values: [10, 30, 60, 120]
+    values: [90, 120]
   trainer.method_args.gamma:
     values: [1.0, 2.0]
   trainer.method_args.alpha:
-    values: [1.0, 2.0]
+    values: [1.0]
 
 command:
   - uv

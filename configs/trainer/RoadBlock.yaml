@@ -5,6 +5,8 @@ handler: RoadBlock
 method_args:
   strength: 42.0
   classifier: oracle
+  continual: false
+  num_centroids: 2
 
 args:
   learning_rate: 1.0e-3

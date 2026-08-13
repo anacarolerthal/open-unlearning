@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import torch
+import pytest
 from hydra import compose, initialize_config_dir
 from torch.utils.data import Dataset
 from transformers import GPT2Config, GPT2LMHeadModel, TrainingArguments
@@ -177,3 +178,41 @@ def test_roadblock_accumulates_and_routes_named_adapters(tmp_path):
     _release_stage_trainer(second)
     assert not hasattr(live_model, "unlearn_classifier_context")
     assert not hasattr(live_model, "roadblock_classifier_threshold")
+
+
+@pytest.mark.parametrize("classifier", ["guard_multiclass", "guard_prototype"])
+def test_learned_continual_router_replays_activations(tmp_path, classifier):
+    first = RoadBlock(
+        model=_model(),
+        args=_args(tmp_path / f"{classifier}_first"),
+        train_dataset=_dataset(),
+        data_collator=_collate,
+        request_name="request_01",
+        classifier=classifier,
+        continual=True,
+        num_centroids=1,
+    )
+    live_model = first.model
+    first.train()
+
+    cache = live_model._roadblock_activation_cache
+    assert cache["retain"].device.type == "cpu"
+    assert set(cache["forget"]) == {"request_01"}
+    assert not any("roadblock_activation_cache" in key for key in live_model.state_dict())
+
+    second = RoadBlock(
+        model=live_model,
+        args=_args(tmp_path / f"{classifier}_second"),
+        train_dataset=_dataset(),
+        data_collator=_collate,
+        request_name="request_02",
+        classifier=classifier,
+        continual=True,
+        num_centroids=1,
+    )
+    second.train()
+    assert second.model is live_model
+    assert set(cache["forget"]) == {"request_01", "request_02"}
+
+    _release_stage_trainer(second)
+    assert hasattr(live_model, "_roadblock_activation_cache")

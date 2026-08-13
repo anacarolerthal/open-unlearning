@@ -1,0 +1,4 @@
+interface:
+  display_name: "Continual Unlearning Tables"
+  short_description: "Render compact Typst unlearning metric tables"
+  default_prompt: "Use $continual-unlearning-table to render a compact Typst PNG from selected continual-unlearning methods, metrics, tasks, and evaluation timing."

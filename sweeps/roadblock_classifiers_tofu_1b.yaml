@@ -7,7 +7,7 @@ metric:
 
 parameters:
   trainer.method_args.classifier:
-    values: [oracle, none, guard, curate]
+    values: [oracle, guard]
 
 command:
   - uv

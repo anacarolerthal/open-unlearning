@@ -47,8 +47,8 @@ z_{\mathrm{out}}(x,t)=z_0(x,t)
 }.
 $$
 
-The router is a GUARD-style MLP over the normalized final prompt-token hidden
-state $e(x)$:
+The ordinary router is a GUARD-style MLP over the normalized final prompt-token
+hidden state $e(x)$:
 
 $$
 g(x)=\mathbb{1}
@@ -127,18 +127,24 @@ signal must be reported separately from behavioral forgetting.
 
 Results: [W&B sweep `2yaxtuaz`](https://wandb.ai/juanbelieni-lab/open-unlearning/sweeps/2yaxtuaz).
 
-## Next: continual unlearning
+## Continual unlearning
 
-The single-request method is now fixed. The next experiment will test an adapter
-bank containing one RoAd transform and routing entry per forget request.
+Continual runs keep the frozen decoder activations and one named RoAd adapter per
+request in memory. At every stage the router is refit from the fixed retain
+activations and replayed forget activations; no previous prompts or checkpoints
+are loaded.
 
-1. Add forget requests sequentially without retraining the backbone.
-2. Route each prompt to zero, one, or multiple adapters and define a simple
-   composition rule when several requests match.
-3. After every addition, evaluate all previous forget requests, retain utility,
-   router false positives, and interference between adapters.
-4. Measure per-request storage, router and adapter latency, and total generation
-   overhead while preserving one backbone pass and the KV cache.
-5. Compare against O3 and other continual-unlearning methods on quality, while
-   emphasizing RoAdBlock's smaller state, explicit routing, and interpretable
-   logit-level suppression.
+Three classifier choices are available to the continual runner:
+
+- `oracle`: use the known request name during evaluation. This is the theoretical
+  routing ceiling.
+- `guard_multiclass`: refit one balanced 128-unit MLP with classes
+  `{retain, request_01, ..., request_t}` and route to the winning request only
+  when it beats retain.
+- `guard_prototype`: use the same binary GUARD gate, then select the request with
+  the highest cosine similarity to its stored KMeans centroids. The default is
+  two centroids per request, preserving the two-author structure of TOFU.
+
+Learned routing always applies zero or one adapter per prompt. The correction and
+router share a single frozen-backbone pass; adapter composition and learned
+soft-routing are intentionally out of scope.
