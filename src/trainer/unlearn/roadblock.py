@@ -23,6 +23,7 @@ class RoadBlock(UnlearnTrainer):
         request_name="forget",
         continual=False,
         num_centroids=2,
+        router_threshold=0.0,
         model=None,
         *args,
         **kwargs,
@@ -63,6 +64,7 @@ class RoadBlock(UnlearnTrainer):
         self.request_name = request_name
         self.continual = bool(continual)
         self.num_centroids = int(num_centroids)
+        self.router_threshold = float(router_threshold)
         self.classifier = RoadBlockClassifier(
             classifier,
             model.config.hidden_size,
@@ -75,6 +77,7 @@ class RoadBlock(UnlearnTrainer):
             num_centroids=self.num_centroids,
             seed=int(self.args.seed),
             continual=self.continual,
+            router_threshold=self.router_threshold,
         )
         self._trained = False
         self._is_forget = False
@@ -93,6 +96,7 @@ class RoadBlock(UnlearnTrainer):
         self.model.unlearn_classifier_context = self.classifier_context
         self.model.roadblock_diagnostic_batch = self.diagnostic_batch
         self.model.roadblock_classify_batch = self.classify_batch
+        self.model.roadblock_router_diagnostics = self.router_diagnostics
         self.model.roadblock_classifier_threshold = lambda: self.classifier.threshold
 
     @contextmanager
@@ -332,6 +336,13 @@ class RoadBlock(UnlearnTrainer):
             }
             for score, prediction, request_name in zip(scores, predictions, details)
         ]
+
+    @torch.no_grad()
+    def router_diagnostics(self):
+        """Return learned-router errors against oracle labels in replay cache."""
+        if not self.continual:
+            return {"available": False, "reason": "not_continual"}
+        return self.classifier.diagnostics(self.model._roadblock_activation_cache)
 
     @torch.no_grad()
     def diagnostic_batch(self, inputs):

@@ -139,6 +139,7 @@ def _release_stage_trainer(trainer):
             "unlearn_classifier_context",
             "roadblock_diagnostic_batch",
             "roadblock_classify_batch",
+            "roadblock_router_diagnostics",
             "roadblock_classifier_threshold",
         ):
             delattr(trainer.model, name)
@@ -177,6 +178,9 @@ def main(cfg: DictConfig):
         "holdout_split": cfg.holdout_split,
         "classifier": cfg.trainer.get("method_args", {}).get("classifier", "oracle"),
         "num_centroids": cfg.trainer.get("method_args", {}).get("num_centroids", 2),
+        "router_threshold": cfg.trainer.get("method_args", {}).get(
+            "router_threshold", 0.0
+        ),
         "requests": partitions,
         "stages": {},
     }
@@ -217,7 +221,13 @@ def main(cfg: DictConfig):
         torch.cuda.empty_cache()
 
         stage_request_logs = []
-        stage_summary = {"requests": {}}
+        router_summary = (
+            trainer.router_diagnostics()
+            if isinstance(trainer, RoadBlock)
+            else {"available": False, "reason": "not_roadblock"}
+        )
+        _write_json(stage_dir / "router_diagnostics.json", router_summary)
+        stage_summary = {"requests": {}, "router": router_summary}
         for request in partitions[:stage_index]:
             request_split = f"train[{request['start']}:{request['stop']}]"
             request_eval_cfg = _evaluation_config(
@@ -261,6 +271,21 @@ def main(cfg: DictConfig):
         _write_json(cumulative_dir / "TOFU_SUMMARY.json", cumulative_summary)
         stage_summary["cumulative"] = cumulative_summary
 
+        router_metrics = {
+            f"continual_router_{name.removeprefix('router_')}": value
+            for name, value in router_summary.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        for request_name, request_metrics in router_summary.get(
+            "per_request", {}
+        ).items():
+            router_metrics.update(
+                {
+                    f"continual_router_{request_name}_{name}": value
+                    for name, value in request_metrics.items()
+                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                }
+            )
         trainer.log(
             {
                 "eval_continual_stage": stage_index,
@@ -272,6 +297,7 @@ def main(cfg: DictConfig):
                     f"eval_continual_{name}": value
                     for name, value in stage_summary["utility"].items()
                 },
+                **router_metrics,
             }
         )
 

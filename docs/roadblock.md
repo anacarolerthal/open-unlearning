@@ -139,8 +139,9 @@ Three classifier choices are available to the continual runner:
 - `oracle`: use the known request name during evaluation. This is the theoretical
   routing ceiling.
 - `guard_multiclass`: refit one balanced 128-unit MLP with classes
-  `{retain, request_01, ..., request_t}` and route to the winning request only
-  when it beats retain.
+  `{retain, request_01, ..., request_t}`. For an input embedding, define
+  `m(x) = max_j z_j(x) - z_retain(x)`; route to the winning request only when
+  it wins and `m(x) >= router_threshold` (default `0.0`).
 - `guard_prototype`: use the same binary GUARD gate, then select the request with
   the highest cosine similarity to its stored KMeans centroids. The default is
   two centroids per request, preserving the two-author structure of TOFU.
@@ -148,3 +149,7 @@ Three classifier choices are available to the continual runner:
 Learned routing always applies zero or one adapter per prompt. The correction and
 router share a single frozen-backbone pass; adapter composition and learned
 soft-routing are intentionally out of scope.
+Continual stages also write `router_diagnostics.json`, reporting replay-set
+agreement with the oracle labels, forget recall, wrong-adapter rate, and retain
+false-positive rate. These diagnostics separate routing error from adapter
+quality.

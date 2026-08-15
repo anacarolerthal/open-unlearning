@@ -24,6 +24,7 @@ class RoadBlockClassifier:
         num_centroids=2,
         seed=0,
         continual=False,
+        router_threshold=0.0,
     ):
         if mode not in self.MODES:
             raise ValueError(
@@ -49,9 +50,12 @@ class RoadBlockClassifier:
         self.num_centroids = int(num_centroids)
         self.seed = int(seed)
         self.continual = bool(continual)
+        self.router_threshold = float(router_threshold)
         self.head = None
         self.prototypes = {}
-        self.threshold = 0.0 if mode == "guard_multiclass" else 0.5
+        self.threshold = (
+            self.router_threshold if mode == "guard_multiclass" else 0.5
+        )
 
         if mode == "guard":
             self.head = self._make_head(1)
@@ -203,8 +207,12 @@ class RoadBlockClassifier:
             request_logits = logits[:, 1:]
             scores = request_logits.max(dim=-1).values - logits[:, 0]
             routes = [
-                self.request_names[index - 1] if index else None
-                for index in choices.tolist()
+                (
+                    self.request_names[index - 1]
+                    if index and score >= self.threshold
+                    else None
+                )
+                for index, score in zip(choices.tolist(), scores.tolist())
             ]
             return scores, routes
 
@@ -240,3 +248,98 @@ class RoadBlockClassifier:
         return scores, torch.tensor(
             [route is not None for route in routes], device=scores.device
         )
+
+    @torch.no_grad()
+    def diagnostics(self, activation_cache):
+        """Compare learned routes with the oracle labels in the replay cache.
+
+        The cache contains the only labels needed for this diagnostic: retain
+        examples should route to ``None`` and each request's examples should
+        route to that request.  This reports the routing error separately from
+        the downstream unlearning metrics, so a gap to oracle can be attributed
+        to the router rather than to the adapter itself.
+        """
+        if self.mode not in self.CONTINUAL_MODES:
+            return {"available": False, "reason": "oracle_or_single_request"}
+
+        retain = activation_cache.get("retain")
+        forget = activation_cache.get("forget", {})
+        if retain is None or not forget:
+            return {"available": False, "reason": "activation_cache_incomplete"}
+
+        names = list(forget)
+        embeddings = torch.cat([retain, *[forget[name] for name in names]])
+        scores, routes = self.route(embeddings)
+        routes = list(routes)
+        expected = [None] * len(retain)
+        for name in names:
+            expected.extend([name] * len(forget[name]))
+
+        def fraction(values, predicate):
+            if not values:
+                return 0.0
+            return float(sum(predicate(value) for value in values) / len(values))
+
+        exact = [route == target for route, target in zip(routes, expected)]
+        retain_routes = routes[: len(retain)]
+        forget_offset = len(retain)
+        forget_routes = routes[forget_offset:]
+        forget_expected = expected[forget_offset:]
+        forget_correct = [
+            route == target for route, target in zip(forget_routes, forget_expected)
+        ]
+        forget_routed = [route is not None for route in forget_routes]
+        wrong_adapter = [
+            route is not None and route != target
+            for route, target in zip(forget_routes, forget_expected)
+        ]
+
+        per_request = {}
+        cursor = 0
+        for name in names:
+            count = len(forget[name])
+            request_routes = forget_routes[cursor : cursor + count]
+            cursor += count
+            per_request[name] = {
+                "count": count,
+                "route_accuracy": fraction(
+                    request_routes,
+                    lambda route, expected_name=name: route == expected_name,
+                ),
+                "recall": fraction(request_routes, lambda route: route is not None),
+                "rejection_rate": fraction(request_routes, lambda route: route is None),
+                "wrong_adapter_rate": fraction(
+                    request_routes,
+                    lambda route, expected_name=name: route is not None
+                    and route != expected_name,
+                ),
+            }
+
+        score_values = torch.as_tensor(scores).detach().float().cpu()
+        return {
+            "available": True,
+            "threshold": float(self.threshold),
+            "num_examples": len(expected),
+            "num_retain_examples": len(retain),
+            "num_forget_examples": len(forget_expected),
+            "router_oracle_accuracy": float(sum(exact) / len(exact)),
+            "router_oracle_gap": float(1.0 - sum(exact) / len(exact)),
+            "forget_route_accuracy": float(sum(forget_correct) / len(forget_correct)),
+            "forget_oracle_gap": float(
+                1.0 - sum(forget_correct) / len(forget_correct)
+            ),
+            "forget_recall": float(sum(forget_routed) / len(forget_routed)),
+            "forget_rejection_rate": float(
+                1.0 - sum(forget_routed) / len(forget_routed)
+            ),
+            "wrong_adapter_rate": float(sum(wrong_adapter) / len(wrong_adapter)),
+            "retain_false_positive_rate": fraction(
+                retain_routes, lambda route: route is not None
+            ),
+            "retain_rejection_rate": fraction(
+                retain_routes, lambda route: route is None
+            ),
+            "score_mean": float(score_values.mean()),
+            "score_std": float(score_values.std(unbiased=False)),
+            "per_request": per_request,
+        }

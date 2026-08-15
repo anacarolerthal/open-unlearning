@@ -178,6 +178,7 @@ def test_roadblock_accumulates_and_routes_named_adapters(tmp_path):
     _release_stage_trainer(second)
     assert not hasattr(live_model, "unlearn_classifier_context")
     assert not hasattr(live_model, "roadblock_classifier_threshold")
+    assert not hasattr(live_model, "roadblock_router_diagnostics")
 
 
 @pytest.mark.parametrize("classifier", ["guard_multiclass", "guard_prototype"])

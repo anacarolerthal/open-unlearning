@@ -2,8 +2,6 @@ program: src/continual_unlearn.py
 project: continual-open-unlearning
 method: grid
 metric:
-  # Select distributionally valid forgetting; answer probability alone
-  # favored catastrophic over-unlearning in the exploratory sweep.
   name: eval/continual_forget_quality
   goal: maximize
 
@@ -19,9 +17,10 @@ command:
   - src/continual_unlearn.py
   - --config-name=continual_unlearn.yaml
   - trainer=NPO
-  - model=Llama-3.2-1B-Instruct
-  - model.model_args.pretrained_model_name_or_path=open-unlearning/tofu_Llama-3.2-1B-Instruct_full
+  - model=Llama-3.2-3B-Instruct
+  - model.model_args.pretrained_model_name_or_path=open-unlearning/tofu_Llama-3.2-3B-Instruct_full
   - model.model_args.attn_implementation=sdpa
+  - retain_logs_path=saves/eval/tofu_Llama-3.2-3B-Instruct_retain95/TOFU_EVAL.json
   - trainer.method_args.beta=0.1
   - trainer.method_args.gamma=1.0
   - trainer.method_args.alpha=1.0
@@ -36,5 +35,5 @@ command:
   - trainer.args.lr_scheduler_type=linear
   - trainer.args.report_to=wandb
   - seed=${trainer.args.seed}
-  - task_name=sweep_continual_npo_seed${trainer.args.seed}_${oc.env:WANDB_RUN_ID}
+  - task_name=sweep_continual_npo_3b_seed${trainer.args.seed}_${oc.env:WANDB_RUN_ID}
   - ${args_no_hyphens}
